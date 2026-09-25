@@ -12,9 +12,15 @@ const dashboardRoutes = require('./src/routes/dashboard');
 const pagosRoutes = require('./src/routes/pagos');
 
 const app = express();
-const PORT = process.env.PORT || 4000;
 
-app.use(cors({ origin: 'http://localhost:3000' }));
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:3002',
+    process.env.FRONTEND_URL,
+  ].filter(Boolean),
+  credentials: true,
+}));
 app.use(express.json());
 
 app.use('/api/auth', authRoutes);
@@ -27,8 +33,8 @@ app.use('/api/pagos', pagosRoutes);
 
 async function start() {
   await testConnection();
-  app.listen(PORT, () => {
-    console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
+  app.listen(process.env.PORT || 3001, () => {
+    console.log(`🚀 Servidor escuchando en http://localhost:${process.env.PORT || 3001}`);
   });
 }
 
