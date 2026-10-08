@@ -100,4 +100,69 @@ async function getProximosVencimientos(limit = 10) {
   return rows;
 }
 
-module.exports = { findAll, findById, findByDNI, create, update, remove, getStats, getProximosVencimientos };
+// "Cuota de referencia": monto del último pago NO anulado del cliente, sin acumular
+// períodos (política acordada para Fase 2 de Facturación). NULL si nunca pagó.
+const ULTIMO_PAGO_MONTO_SQL = `(
+  SELECT p.monto FROM pagos p
+  WHERE p.cliente_id = clientes.id AND p.anulado = false
+  ORDER BY p.fecha_pago DESC LIMIT 1
+)`;
+
+function buildBusquedaNombreDni(query, p) {
+  return query ? ` AND (apellido || ' ' || nombre || ' ' || dni) ILIKE ${p(`%${query}%`)}` : '';
+}
+
+// Paginado; devuelve además total_count y total_adeudado (ambos agregados sobre el
+// conjunto filtrado completo, no solo la página) vía window functions.
+async function findMorosos({ query, limit = 20, offset = 0 } = {}) {
+  const params = [];
+  const p = (v) => { params.push(v); return `$${params.length}`; };
+  const where = `${ESTADO_CUOTA_SQL} = 'moroso'${buildBusquedaNombreDni(query, p)}`;
+
+  const { rows } = await pool.query(`
+    SELECT id, apellido || ', ' || nombre AS nombre_completo, dni, fecha_vencimiento,
+      (${HOY_SQL} - fecha_vencimiento)::int AS dias_atraso,
+      ${ULTIMO_PAGO_MONTO_SQL} AS monto_referencia,
+      COUNT(*) OVER()::int AS total_count,
+      COALESCE(SUM(${ULTIMO_PAGO_MONTO_SQL}) OVER(), 0) AS total_adeudado
+    FROM clientes
+    WHERE ${where}
+    ORDER BY dias_atraso DESC, apellido, nombre
+    LIMIT ${p(limit)} OFFSET ${p(offset)}
+  `, params);
+
+  return {
+    rows: rows.map(({ total_count, total_adeudado, ...r }) => r),
+    totalCount: rows[0]?.total_count ?? 0,
+    totalAdeudado: Number(rows[0]?.total_adeudado ?? 0),
+  };
+}
+
+async function findPorVencer({ query, limit = 20, offset = 0 } = {}) {
+  const params = [];
+  const p = (v) => { params.push(v); return `$${params.length}`; };
+  const where = `${ESTADO_CUOTA_SQL} = 'por_vencer'${buildBusquedaNombreDni(query, p)}`;
+
+  const { rows } = await pool.query(`
+    SELECT id, apellido || ', ' || nombre AS nombre_completo, dni, fecha_vencimiento,
+      (fecha_vencimiento - ${HOY_SQL})::int AS dias_restantes,
+      ${ULTIMO_PAGO_MONTO_SQL} AS monto_referencia,
+      COUNT(*) OVER()::int AS total_count,
+      COALESCE(SUM(${ULTIMO_PAGO_MONTO_SQL}) OVER(), 0) AS proyeccion_ingresos
+    FROM clientes
+    WHERE ${where}
+    ORDER BY fecha_vencimiento ASC, apellido, nombre
+    LIMIT ${p(limit)} OFFSET ${p(offset)}
+  `, params);
+
+  return {
+    rows: rows.map(({ total_count, proyeccion_ingresos, ...r }) => r),
+    totalCount: rows[0]?.total_count ?? 0,
+    proyeccionIngresos: Number(rows[0]?.proyeccion_ingresos ?? 0),
+  };
+}
+
+module.exports = {
+  findAll, findById, findByDNI, create, update, remove, getStats, getProximosVencimientos,
+  findMorosos, findPorVencer,
+};

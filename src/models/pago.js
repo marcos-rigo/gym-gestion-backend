@@ -190,4 +190,68 @@ async function getStatsFacturacion() {
   };
 }
 
-module.exports = { create, anular, findById, findByCliente, findAll, count, getStatsFacturacion };
+// Cierre de caja de un día: totales generales, por método y por empleado (con su propio
+// desglose por método), más las anulaciones del día aparte como dato informativo.
+// `usuarioId` restringe todo al turno de ese empleado (lo decide el controller según permisos).
+async function getCierreCaja({ fecha, usuarioId } = {}) {
+  const params = [fecha];
+  let filtroUsuario = '';
+  if (usuarioId) {
+    params.push(usuarioId);
+    filtroUsuario = ` AND p.usuario_id = $2`;
+  }
+
+  const { rows } = await pool.query(`
+    SELECT p.usuario_id, u.nombre AS usuario_nombre, p.metodo, p.anulado,
+      COUNT(*)::int AS cantidad, COALESCE(SUM(p.monto), 0) AS monto
+    FROM pagos p
+    LEFT JOIN usuarios u ON u.id = p.usuario_id
+    WHERE (p.fecha_pago AT TIME ZONE '${TZ}')::date = $1::date${filtroUsuario}
+    GROUP BY p.usuario_id, u.nombre, p.metodo, p.anulado
+  `, params);
+
+  const vigentes = rows.filter((r) => !r.anulado);
+  const anuladas = rows.filter((r) => r.anulado);
+
+  const porMetodoMap = new Map();
+  const porEmpleadoMap = new Map();
+  for (const r of vigentes) {
+    const monto = Number(r.monto);
+
+    const metodoAcc = porMetodoMap.get(r.metodo) ?? { metodo: r.metodo, monto: 0, cantidad: 0 };
+    metodoAcc.monto += monto;
+    metodoAcc.cantidad += r.cantidad;
+    porMetodoMap.set(r.metodo, metodoAcc);
+
+    const empKey = r.usuario_id ?? 'sin-empleado';
+    const empAcc = porEmpleadoMap.get(empKey) ?? {
+      usuarioId: r.usuario_id,
+      usuarioNombre: r.usuario_nombre ?? 'Sin empleado asignado',
+      monto: 0,
+      cantidad: 0,
+      porMetodo: [],
+    };
+    empAcc.monto += monto;
+    empAcc.cantidad += r.cantidad;
+    empAcc.porMetodo.push({ metodo: r.metodo, monto, cantidad: r.cantidad });
+    porEmpleadoMap.set(empKey, empAcc);
+  }
+
+  return {
+    fecha,
+    general: {
+      monto: vigentes.reduce((acc, r) => acc + Number(r.monto), 0),
+      cantidad: vigentes.reduce((acc, r) => acc + r.cantidad, 0),
+    },
+    porMetodo: [...porMetodoMap.values()],
+    porEmpleado: [...porEmpleadoMap.values()],
+    anulados: {
+      cantidad: anuladas.reduce((acc, r) => acc + r.cantidad, 0),
+      monto: anuladas.reduce((acc, r) => acc + Number(r.monto), 0),
+    },
+  };
+}
+
+module.exports = {
+  create, anular, findById, findByCliente, findAll, count, getStatsFacturacion, getCierreCaja,
+};

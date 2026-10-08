@@ -143,4 +143,50 @@ async function remove(req, res) {
   }
 }
 
-module.exports = { getAll, getById, create, update, remove };
+const listadoSchema = { query: V.texto('La búsqueda', { max: 100 }) };
+
+function paginacion(req) {
+  const page = Number.parseInt(req.query.page, 10) || 1;
+  const pageSize = Math.min(Number.parseInt(req.query.pageSize, 10) || 20, 100);
+  return { page, pageSize, offset: (page - 1) * pageSize };
+}
+
+async function getMorosos(req, res) {
+  try {
+    const { ok, values: v, errors } = V.validate(req.query, listadoSchema, { partial: true });
+    if (!ok) return V.sendValidationError(res, errors);
+    const { page, pageSize, offset } = paginacion(req);
+
+    const { rows, totalCount, totalAdeudado } = await cliente.findMorosos({
+      query: v.query, limit: pageSize, offset,
+    });
+    return res.json({
+      data: toCamelCase(rows),
+      meta: { page, pageSize, total: totalCount, totalAdeudado },
+    });
+  } catch (err) {
+    console.error('cliente.getMorosos error:', err);
+    return res.status(500).json({ message: 'Error interno del servidor' });
+  }
+}
+
+async function getPorVencer(req, res) {
+  try {
+    const { ok, values: v, errors } = V.validate(req.query, listadoSchema, { partial: true });
+    if (!ok) return V.sendValidationError(res, errors);
+    const { page, pageSize, offset } = paginacion(req);
+
+    const { rows, totalCount, proyeccionIngresos } = await cliente.findPorVencer({
+      query: v.query, limit: pageSize, offset,
+    });
+    return res.json({
+      data: toCamelCase(rows),
+      meta: { page, pageSize, total: totalCount, proyeccionIngresos },
+    });
+  } catch (err) {
+    console.error('cliente.getPorVencer error:', err);
+    return res.status(500).json({ message: 'Error interno del servidor' });
+  }
+}
+
+module.exports = { getAll, getById, create, update, remove, getMorosos, getPorVencer };

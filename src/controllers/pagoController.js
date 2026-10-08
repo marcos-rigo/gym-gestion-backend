@@ -1,5 +1,7 @@
 const pago = require('../models/pago');
+const rol = require('../models/rol');
 const V = require('../utils/validators');
+const { hoyISO } = require('../config/fechas');
 
 function toCamelCase(obj) {
   if (!obj) return null;
@@ -118,4 +120,27 @@ async function getStats(req, res) {
   }
 }
 
-module.exports = { create, anular, findAll, findByCliente, getStats };
+const cierreCajaSchema = { fecha: V.fecha('La fecha') };
+
+// Admin/Dueño ven el cierre completo (todos los empleados); un Empleado solo ve su propio turno.
+// Se decide en el backend (no alcanza con ocultarlo en el frontend).
+async function getCierreCaja(req, res) {
+  try {
+    const { ok, values: v, errors } = V.validate(req.query, cierreCajaSchema, { partial: true });
+    if (!ok) return V.sendValidationError(res, errors);
+
+    const rolData = await rol.findBasicById(req.user.id_rol);
+    const verTodos = !!rolData && (rolData.es_admin || rolData.descripcion === 'Dueño');
+
+    const data = await pago.getCierreCaja({
+      fecha: v.fecha || hoyISO(),
+      usuarioId: verTodos ? undefined : req.user.id,
+    });
+    return res.json({ data });
+  } catch (err) {
+    console.error('pago.getCierreCaja error:', err);
+    return res.status(500).json({ message: 'Error interno del servidor' });
+  }
+}
+
+module.exports = { create, anular, findAll, findByCliente, getStats, getCierreCaja };

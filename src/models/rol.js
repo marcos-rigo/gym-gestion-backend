@@ -24,7 +24,7 @@ async function findById(id) {
 
 // Versión liviana para validar existencia / es_admin sin armar permisos.
 async function findBasicById(id) {
-  const { rows } = await pool.query('SELECT id, es_admin FROM roles WHERE id = $1', [id]);
+  const { rows } = await pool.query('SELECT id, es_admin, descripcion FROM roles WHERE id = $1', [id]);
   return rows[0] ?? null;
 }
 
