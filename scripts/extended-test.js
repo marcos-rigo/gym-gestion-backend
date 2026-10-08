@@ -14,7 +14,7 @@ const H = require('./smoke-test'); // registra la suite base y sus hooks before/
 const { api, login, dbUser, dbRole, crearCliente, assertErrores, ctx, randLetters, randDni, testEmail, clienteBase, PASSWORD, external } = H;
 
 const { pool } = require('../src/config/db');
-const { hoyISO, addDays, POR_VENCER_DIAS, TZ } = require('../src/config/fechas');
+const { hoyISO, addDays, POR_VENCER_DIAS, PERIODO_DIAS, TZ } = require('../src/config/fechas');
 const usuarioModel = require('../src/models/usuario');
 const clienteModel = require('../src/models/cliente');
 
@@ -753,5 +753,336 @@ describe('clientes y usuarios: bordes adicionales', () => {
   it('usuarios: nunca se expone password_hash', async () => {
     const lista = (await api('GET', '/api/usuarios', { token: ctx.admin })).text;
     assert.ok(!/password/i.test(lista));
+  });
+});
+
+// ───────────────────────── Fase 2: inserta un pago "a mano" sin pasar por el controller,
+// para poder fijar usuario/método/fecha/anulado libremente sin tocar el vencimiento del cliente.
+async function sqlPago({ clienteId, usuarioId, monto, metodo = 'efectivo', fechaLocal, hora = '12:00', anulado = false, periodoDesde, periodoHasta }) {
+  const desde = periodoDesde ?? fechaLocal;
+  const hasta = periodoHasta ?? addDays(fechaLocal, PERIODO_DIAS);
+  const { rows } = await pool.query(
+    `INSERT INTO pagos (cliente_id, usuario_id, monto, metodo, periodo_desde, periodo_hasta, fecha_pago, anulado)
+     VALUES ($1,$2,$3,$4,$5::date,$6::date, (($7::date + $8::time) AT TIME ZONE $9), $10)
+     RETURNING id`,
+    [clienteId, usuarioId, monto, metodo, desde, hasta, fechaLocal, hora, TZ, anulado]
+  );
+  return rows[0].id;
+}
+
+const bucketDe = (d) => (d < 0 ? 'moroso' : d <= POR_VENCER_DIAS ? 'por_vencer' : 'al_dia');
+
+async function getMorosos(token, query, extra = '') {
+  const qs = new URLSearchParams({ ...(query ? { query } : {}), ...Object.fromEntries(new URLSearchParams(extra)) });
+  return api('GET', `/api/clientes/morosos?${qs}`, { token });
+}
+async function getPorVencer(token, query, extra = '') {
+  const qs = new URLSearchParams({ ...(query ? { query } : {}), ...Object.fromEntries(new URLSearchParams(extra)) });
+  return api('GET', `/api/clientes/por-vencer?${qs}`, { token });
+}
+
+describe('Fase 2: morosos y por-vencer', () => {
+  it('sin token -> 401; sin facturacion_ver -> 403', async () => {
+    assert.equal((await api('GET', '/api/clientes/morosos')).status, 401);
+    assert.equal((await api('GET', '/api/clientes/por-vencer')).status, 401);
+    assert.equal((await getMorosos(ctx.limitado)).status, 403, 'limitado solo tiene clientes_ver');
+    assert.equal((await getPorVencer(ctx.limitado)).status, 403);
+  });
+
+  it('bordes de fecha: vence hoy, ayer, en 2/3/7 días caen en el bucket correcto; en 8 días no aparece en ninguno', async () => {
+    const h = hoyISO();
+    const offsets = [...new Set([0, -1, 2, 3, POR_VENCER_DIAS, POR_VENCER_DIAS + 1])];
+
+    for (const d of offsets) {
+      const marker = `Zz${randLetters(10)}`;
+      const venc = addDays(h, d);
+      const c = await crearCliente({ apellido: marker, fechaInicioCuota: addDays(venc, -30), fechaVencimiento: venc });
+      const bucket = bucketDe(d);
+
+      if (bucket === 'moroso') {
+        const r = await getMorosos(ctx.admin, marker);
+        assert.equal(r.status, 200, r.text);
+        assert.equal(r.body.meta.total, 1, `offset ${d}`);
+        assert.equal(r.body.data[0].id, c.id);
+        assert.equal(r.body.data[0].diasAtraso, -d, `diasAtraso offset ${d}`);
+        assert.equal(r.body.data[0].fechaVencimiento, venc);
+        assert.equal((await getPorVencer(ctx.admin, marker)).body.meta.total, 0, `offset ${d} no debe estar en por-vencer`);
+      } else if (bucket === 'por_vencer') {
+        const r = await getPorVencer(ctx.admin, marker);
+        assert.equal(r.status, 200, r.text);
+        assert.equal(r.body.meta.total, 1, `offset ${d}`);
+        assert.equal(r.body.data[0].id, c.id);
+        assert.equal(r.body.data[0].diasRestantes, d, `diasRestantes offset ${d}`);
+        assert.equal((await getMorosos(ctx.admin, marker)).body.meta.total, 0, `offset ${d} no debe estar en morosos`);
+      } else {
+        assert.equal((await getMorosos(ctx.admin, marker)).body.meta.total, 0, `offset ${d} (al_dia) no debe estar en morosos`);
+        assert.equal((await getPorVencer(ctx.admin, marker)).body.meta.total, 0, `offset ${d} (al_dia) no debe estar en por-vencer`);
+      }
+    }
+  });
+
+  it('cuota de referencia = monto del último pago NO anulado; sin pagos -> sin referencia (null)', async () => {
+    const h = hoyISO();
+    const sinPago = await crearCliente({ apellido: `Zz${randLetters(10)}`, fechaInicioCuota: addDays(h, -31), fechaVencimiento: addDays(h, -1) });
+    const r1 = await getMorosos(ctx.admin, sinPago.apellido);
+    assert.equal(r1.body.data[0].montoReferencia, null);
+
+    const conPago = await crearCliente({ apellido: `Zz${randLetters(10)}`, fechaInicioCuota: addDays(h, -31), fechaVencimiento: addDays(h, -1) });
+    await sqlPago({ clienteId: conPago.id, usuarioId: ctx.adminId, monto: 456.78, fechaLocal: addDays(h, -10) });
+    const r2 = await getMorosos(ctx.admin, conPago.apellido);
+    assert.equal(Number(r2.body.data[0].montoReferencia), 456.78);
+
+    // un pago vigente más viejo gana contra un pago anulado más nuevo
+    const conAnulado = await crearCliente({ apellido: `Zz${randLetters(10)}`, fechaInicioCuota: addDays(h, -31), fechaVencimiento: addDays(h, -1) });
+    await sqlPago({ clienteId: conAnulado.id, usuarioId: ctx.adminId, monto: 100, fechaLocal: addDays(h, -20) });
+    await sqlPago({ clienteId: conAnulado.id, usuarioId: ctx.adminId, monto: 999, fechaLocal: addDays(h, -5), anulado: true });
+    const r3 = await getMorosos(ctx.admin, conAnulado.apellido);
+    assert.equal(Number(r3.body.data[0].montoReferencia), 100, 'el pago anulado más reciente no cuenta como referencia');
+  });
+
+  it('búsqueda por nombre (apellido) y por DNI', async () => {
+    const h = hoyISO();
+    const marker = `Zz${randLetters(10)}`;
+    const c = await crearCliente({ apellido: marker, fechaInicioCuota: addDays(h, -31), fechaVencimiento: addDays(h, -1) });
+    assert.equal((await getMorosos(ctx.admin, marker)).body.data[0].id, c.id, 'por apellido');
+    assert.equal((await getMorosos(ctx.admin, c.dni)).body.data[0].id, c.id, 'por dni');
+    assert.equal((await getMorosos(ctx.admin, `Zz${randLetters(12)}`)).body.meta.total, 0, 'marker inexistente no matchea');
+  });
+
+  it('paginación (>20) y total/montos agregados sobre todo el conjunto filtrado, no la página', async () => {
+    const h = hoyISO();
+    const marker = `Zz${randLetters(10)}`;
+    const N = 23;
+    let sumaEsperada = 0;
+    for (let i = 0; i < N; i++) {
+      const monto = (i + 1) * 10;
+      sumaEsperada += monto;
+      const c = await crearCliente({
+        nombre: `Masivo${String.fromCharCode(97 + i)}`, apellido: marker,
+        fechaInicioCuota: addDays(h, -32), fechaVencimiento: addDays(h, -2),
+      });
+      await sqlPago({ clienteId: c.id, usuarioId: ctx.adminId, monto, fechaLocal: addDays(h, -15) });
+    }
+
+    const p1 = await getMorosos(ctx.admin, marker, 'page=1');
+    assert.equal(p1.body.meta.total, N);
+    assert.equal(p1.body.meta.pageSize, 20);
+    assert.equal(p1.body.data.length, 20);
+    assert.equal(p1.body.meta.totalAdeudado, sumaEsperada, 'total adeudado ya en la página 1 es el del conjunto completo');
+
+    const p2 = await getMorosos(ctx.admin, marker, 'page=2');
+    assert.equal(p2.body.meta.total, N);
+    assert.equal(p2.body.data.length, 3);
+    assert.equal(p2.body.meta.totalAdeudado, sumaEsperada, 'el total adeudado no cambia entre páginas');
+
+    const idsP1 = p1.body.data.map((x) => x.id);
+    const idsP2 = p2.body.data.map((x) => x.id);
+    assert.equal(new Set([...idsP1, ...idsP2]).size, N, 'sin duplicados ni faltantes entre páginas');
+  });
+
+  it('por-vencer: paginación y proyección de ingresos sobre todo el conjunto filtrado', async () => {
+    const h = hoyISO();
+    const marker = `Zz${randLetters(10)}`;
+    const N = 22;
+    let sumaEsperada = 0;
+    for (let i = 0; i < N; i++) {
+      const monto = (i + 1) * 5;
+      sumaEsperada += monto;
+      const c = await crearCliente({
+        nombre: `Pronto${String.fromCharCode(97 + i)}`, apellido: marker,
+        fechaInicioCuota: addDays(h, 3 - 30), fechaVencimiento: addDays(h, 3),
+      });
+      await sqlPago({ clienteId: c.id, usuarioId: ctx.adminId, monto, fechaLocal: addDays(h, -27) });
+    }
+
+    const p1 = await getPorVencer(ctx.admin, marker, 'page=1');
+    assert.equal(p1.body.meta.total, N);
+    assert.equal(p1.body.data.length, 20);
+    assert.equal(p1.body.meta.proyeccionIngresos, sumaEsperada);
+
+    const p2 = await getPorVencer(ctx.admin, marker, 'page=2');
+    assert.equal(p2.body.data.length, 2);
+    assert.equal(p2.body.meta.proyeccionIngresos, sumaEsperada, 'no cambia entre páginas');
+  });
+});
+
+describe('Fase 2: cierre de caja', () => {
+  const D = addDays(hoyISO(), -1000);
+  const D_SIN_MOVIMIENTOS = addDays(D, -1);
+  const D2 = addDays(hoyISO(), -1050);
+  let empleadoA, empleadoB, cli;
+
+  before(async () => {
+    const rolId = await dbRole(`Zztest${randLetters()}`, ['facturacion_ver']);
+    empleadoA = { email: testEmail('cierreA') };
+    empleadoA.id = await dbUser({ nombre: 'Cierre A', email: empleadoA.email, idRol: rolId });
+    empleadoA.token = await login(empleadoA.email);
+    empleadoB = { email: testEmail('cierreB') };
+    empleadoB.id = await dbUser({ nombre: 'Cierre B', email: empleadoB.email, idRol: rolId });
+    empleadoB.token = await login(empleadoB.email);
+    cli = await crearCliente();
+
+    await sqlPago({ clienteId: cli.id, usuarioId: empleadoA.id, monto: 100, metodo: 'efectivo', fechaLocal: D });
+    await sqlPago({ clienteId: cli.id, usuarioId: empleadoA.id, monto: 50, metodo: 'tarjeta', fechaLocal: D });
+    await sqlPago({ clienteId: cli.id, usuarioId: empleadoB.id, monto: 200, metodo: 'transferencia', fechaLocal: D });
+    await sqlPago({ clienteId: cli.id, usuarioId: empleadoA.id, monto: 999, metodo: 'efectivo', fechaLocal: D, anulado: true });
+
+    await sqlPago({ clienteId: cli.id, usuarioId: ctx.adminId, monto: 11, fechaLocal: D2, hora: '23:59:30' });
+    await sqlPago({ clienteId: cli.id, usuarioId: ctx.adminId, monto: 22, fechaLocal: addDays(D2, 1), hora: '00:00:30' });
+  });
+
+  const cierre = (token, fecha, extra = '') => api('GET', `/api/pagos/cierre-caja?fecha=${fecha}${extra}`, { token });
+
+  it('sin token -> 401; sin facturacion_ver -> 403', async () => {
+    assert.equal((await api('GET', `/api/pagos/cierre-caja?fecha=${D}`)).status, 401);
+    assert.equal((await cierre(ctx.limitado, D)).status, 403);
+  });
+
+  it('fecha inválida -> 400', async () => {
+    assert.equal((await cierre(ctx.admin, '2024-13-40')).status, 400);
+    assert.equal((await cierre(ctx.admin, 'no-es-fecha')).status, 400);
+  });
+
+  it('Admin ve todos los empleados; totales por método y por empleado cierran contra el general; anulados separados', async () => {
+    const r = await cierre(ctx.admin, D);
+    assert.equal(r.status, 200, r.text);
+    const { data } = r.body;
+    assert.equal(data.general.monto, 350);
+    assert.equal(data.general.cantidad, 3);
+
+    const sumaMetodo = data.porMetodo.reduce((acc, x) => acc + x.monto, 0);
+    const sumaEmpleado = data.porEmpleado.reduce((acc, x) => acc + x.monto, 0);
+    assert.equal(sumaMetodo, data.general.monto, 'porMetodo cierra contra el general');
+    assert.equal(sumaEmpleado, data.general.monto, 'porEmpleado cierra contra el general');
+
+    const a = data.porEmpleado.find((x) => x.usuarioId === empleadoA.id);
+    assert.equal(a.monto, 150);
+    assert.equal(a.cantidad, 2);
+    assert.deepEqual(a.porMetodo.map((x) => x.metodo).sort(), ['efectivo', 'tarjeta']);
+    assert.equal(a.porMetodo.find((x) => x.metodo === 'efectivo').monto, 100, 'el anulado no se suma al vigente');
+
+    const b = data.porEmpleado.find((x) => x.usuarioId === empleadoB.id);
+    assert.equal(b.monto, 200);
+    assert.equal(b.cantidad, 1);
+
+    assert.equal(data.anulados.cantidad, 1);
+    assert.equal(data.anulados.monto, 999);
+  });
+
+  it('Dueño también ve el cierre completo', async (t) => {
+    if (!ctx.dueno) return t.skip('no existe el rol Dueño');
+    const r = await cierre(ctx.dueno, D);
+    assert.equal(r.body.data.general.monto, 350);
+    assert.equal(r.body.data.porEmpleado.length, 2);
+  });
+
+  it('un Empleado ve SOLO sus propios cobros, aunque mande usuarioId de otro empleado en la query', async () => {
+    const r = await cierre(empleadoA.token, D, `&usuarioId=${empleadoB.id}`);
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.body.data.general.monto, 150, 'solo lo de empleadoA, el query param se ignora');
+    assert.equal(r.body.data.general.cantidad, 2);
+    assert.equal(r.body.data.porEmpleado.length, 1);
+    assert.equal(r.body.data.porEmpleado[0].usuarioId, empleadoA.id);
+  });
+
+  it('día sin movimientos: todo en cero', async () => {
+    const r = await cierre(ctx.admin, D_SIN_MOVIMIENTOS);
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual(r.body.data.general, { monto: 0, cantidad: 0 });
+    assert.deepEqual(r.body.data.porMetodo, []);
+    assert.deepEqual(r.body.data.porEmpleado, []);
+    assert.deepEqual(r.body.data.anulados, { cantidad: 0, monto: 0 });
+  });
+
+  it('pagos cerca de medianoche respetan la zona horaria de Tucumán (no la fecha UTC)', async () => {
+    const antesMedianoche = await cierre(ctx.admin, D2);
+    assert.equal(antesMedianoche.body.data.general.monto, 11, '23:59:30 local sigue siendo del día D2');
+    const despuesMedianoche = await cierre(ctx.admin, addDays(D2, 1));
+    assert.equal(despuesMedianoche.body.data.general.monto, 22, '00:00:30 local ya es del día siguiente');
+  });
+});
+
+describe('Fase 2: anular un pago actualiza cierre de caja y morosos', () => {
+  it('anular revierte la cuota al pago vigente anterior y el cliente vuelve a aparecer en morosos', async () => {
+    const h = hoyISO();
+    const marker = `Zz${randLetters(10)}`;
+    const c = await crearCliente({ apellido: marker, fechaInicioCuota: addDays(h, -50), fechaVencimiento: addDays(h, -20) });
+
+    // Pago previo (simulado por SQL) cuyo período ya venció hace 10 días: si fuera el último
+    // pago vigente, el cliente sería moroso.
+    const pago1Fecha = addDays(h, -40);
+    await sqlPago({
+      clienteId: c.id, usuarioId: ctx.adminId, monto: 300, fechaLocal: pago1Fecha,
+      periodoDesde: addDays(h, -40), periodoHasta: addDays(h, -10),
+    });
+    await pool.query(
+      'UPDATE clientes SET fecha_inicio_cuota = $1, fecha_vencimiento = $2 WHERE id = $3',
+      [addDays(h, -40), addDays(h, -10), c.id]
+    );
+    assert.equal((await api('GET', `/api/clientes/${c.id}`, { token: ctx.admin })).body.data.estadoCuota, 'moroso');
+    assert.equal((await getMorosos(ctx.admin, marker)).body.meta.total, 1);
+
+    // Cobro nuevo (vía API): el cliente pasa a al_dia y sale de morosos.
+    const cobro = await api('POST', '/api/pagos', { token: ctx.admin, body: { clienteId: c.id, monto: 500, metodo: 'efectivo' } });
+    assert.equal(cobro.status, 201, cobro.text);
+    assert.equal((await api('GET', `/api/clientes/${c.id}`, { token: ctx.admin })).body.data.estadoCuota, 'al_dia');
+    assert.equal((await getMorosos(ctx.admin, marker)).body.meta.total, 0, 'ya no es moroso tras el cobro');
+
+    // cierre de caja de hoy refleja el cobro nuevo
+    const antes = await api('GET', `/api/pagos/cierre-caja?fecha=${h}`, { token: ctx.admin });
+    // (el cobro ya está adentro de "antes" porque se hizo recién arriba; medimos contra un cierre previo al cobro)
+    const antesDelCobro = antes.body.data.general.monto - 500;
+
+    // Anular el pago nuevo: sin permiso -> 403
+    assert.equal((await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { token: ctx.limitado, body: { motivo: 'x' } })).status, 403);
+    assert.equal((await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { body: { motivo: 'x' } })).status, 401);
+
+    const anular = await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'Prueba automatizada' } });
+    assert.equal(anular.status, 200, anular.text);
+
+    // el cliente vuelve al estado del pago vigente anterior: moroso otra vez
+    const final = await api('GET', `/api/clientes/${c.id}`, { token: ctx.admin });
+    assert.equal(final.body.data.estadoCuota, 'moroso');
+    assert.equal(final.body.data.fechaVencimiento, addDays(h, -10));
+
+    const morososFinal = await getMorosos(ctx.admin, marker);
+    assert.equal(morososFinal.body.meta.total, 1, 'reaparece en morosos');
+    assert.equal(Number(morososFinal.body.data[0].montoReferencia), 300, 'la referencia vuelve a ser el pago anterior vigente');
+
+    // cierre de caja de hoy: vuelve a los valores previos al cobro anulado, y el anulado queda aparte
+    const despues = await api('GET', `/api/pagos/cierre-caja?fecha=${h}`, { token: ctx.admin });
+    assert.equal(despues.body.data.general.monto, antesDelCobro, 'el monto anulado se excluye del total');
+    assert.ok(despues.body.data.anulados.monto >= 500);
+  });
+
+  it('anular exige el permiso facturacion_anular (distinto de facturacion_ver/facturacion_cobrar)', async () => {
+    const h = hoyISO();
+    const c = await crearCliente({ fechaVencimiento: addDays(h, 10) });
+    const cobro = await api('POST', '/api/pagos', { token: ctx.admin, body: { clienteId: c.id, monto: 42, metodo: 'efectivo' } });
+    assert.equal(cobro.status, 201, cobro.text);
+
+    const sinAnular = await dbRole(`Zztest${randLetters()}`, ['facturacion_ver', 'facturacion_cobrar']);
+    const email1 = testEmail('sinanular');
+    await dbUser({ nombre: 'Sin Anular', email: email1, idRol: sinAnular });
+    const t1 = await login(email1);
+    const r1 = await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { token: t1, body: { motivo: 'x' } });
+    assert.equal(r1.status, 403, r1.text);
+
+    const conAnular = await dbRole(`Zztest${randLetters()}`, ['facturacion_anular']);
+    const email2 = testEmail('conanular');
+    await dbUser({ nombre: 'Con Anular', email: email2, idRol: conAnular });
+    const t2 = await login(email2);
+    const r2 = await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { token: t2, body: { motivo: 'x' } });
+    assert.equal(r2.status, 200, r2.text);
+  });
+
+  it('motivo requerido; pago inexistente -> 404; doble anulación -> 409', async () => {
+    const h = hoyISO();
+    const c = await crearCliente({ fechaVencimiento: addDays(h, 10) });
+    const cobro = await api('POST', '/api/pagos', { token: ctx.admin, body: { clienteId: c.id, monto: 42, metodo: 'efectivo' } });
+    assertErrores(await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { token: ctx.admin, body: {} }), ['motivo']);
+    assert.equal((await api('POST', `/api/pagos/${crypto.randomUUID()}/anular`, { token: ctx.admin, body: { motivo: 'x' } })).status, 404);
+    assert.equal((await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'ok' } })).status, 200);
+    assert.equal((await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'otra vez' } })).status, 409);
   });
 });

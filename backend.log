@@ -1,0 +1,4 @@
+◇ injected env (7) from .env
+⚠️  Node.js 20 and below are deprecated and will no longer be supported in future versions of @supabase/supabase-js. Please upgrade to Node.js 22 or later. For more information, visit: https://github.com/orgs/supabase/discussions/45715
+✅ Conectado a Postgres (Supabase)
+🚀 Servidor escuchando en http://localhost:3001
