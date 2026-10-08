@@ -44,3 +44,5 @@ The server reads `PORT` from `.env` (defaults to 4000 in code, but `.env` curren
 ## Environment
 
 Required `.env` variables: `PORT`, `CORS_ORIGIN` (orígenes separados por coma; default `http://localhost:3000`), `SUPERADMIN_EMAIL`, `APP_TIMEZONE`, `POR_VENCER_DIAS` (los tres opcionales; ver `.env.example`), `DATABASE_URL` (Postgres/Supabase connection string), `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `JWT_SECRET`. `app.js` aborta al iniciar si faltan las requeridas.
+
+**Infra**: Render aloja únicamente el servicio Express (sin Postgres propio) — el Postgres que Render provisiona al crear el servicio no se usa. Supabase Postgres es la única base de datos (y también Supabase Storage para `fotos-clientes`); `DATABASE_URL` en Render debe apuntar al connection string de Supabase, igual que en `.env` local.

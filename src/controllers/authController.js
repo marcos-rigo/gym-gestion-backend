@@ -10,10 +10,14 @@ async function login(req, res) {
       return res.status(400).json({ message: 'Email y contraseña requeridos' });
     }
 
+    console.log('[DEBUG login] email recibido:', email.trim());
+
     const user = await usuario.findByEmail(email.trim());
+    console.log('[DEBUG login] usuario encontrado:', !!user, user ? { id: user.id, activo: user.activo, tieneHash: !!user.password_hash } : null);
     if (!user) return res.status(401).json({ message: 'Credenciales inválidas' });
 
     const valido = await bcrypt.compare(password, user.password_hash);
+    console.log('[DEBUG login] bcrypt.compare resultado:', valido);
     if (!valido) return res.status(401).json({ message: 'Credenciales inválidas' });
 
     const payload = { id: user.id, nombre: user.nombre, email: user.email };
