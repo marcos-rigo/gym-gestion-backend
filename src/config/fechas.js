@@ -1,5 +1,5 @@
 // Fechas de negocio: todo se calcula en la zona horaria del gimnasio, no en UTC.
-const TZ = process.env.APP_TIMEZONE || 'America/Argentina/Buenos_Aires';
+const TZ = process.env.APP_TIMEZONE || 'America/Argentina/Tucuman';
 if (!/^[A-Za-z_/+-]+$/.test(TZ)) throw new Error(`APP_TIMEZONE inválida: ${TZ}`);
 
 // Días de antelación para considerar una cuota "por vencer" (única fuente de verdad).

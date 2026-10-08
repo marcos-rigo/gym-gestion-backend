@@ -21,6 +21,19 @@ const schema = {
   metodo: V.enumOf('El método de pago', ['efectivo', 'tarjeta', 'transferencia'], { required: true }),
 };
 
+const findAllSchema = {
+  desde: V.fecha('Desde'),
+  hasta: V.fecha('Hasta'),
+  metodo: V.enumOf('El método de pago', ['efectivo', 'tarjeta', 'transferencia']),
+  usuarioId: V.uuid('El empleado'),
+  estado: V.enumOf('El estado', ['vigente', 'anulado']),
+  clienteQuery: V.texto('La búsqueda', { max: 100 }),
+};
+
+const anularSchema = {
+  motivo: V.texto('El motivo', { required: true, max: 300 }),
+};
+
 async function create(req, res) {
   try {
     const { ok, values: v, errors } = V.validate(req.body, schema);
@@ -33,6 +46,54 @@ async function create(req, res) {
       return res.status(404).json({ message: 'Cliente no encontrado' });
     }
     console.error('pago.create error:', err);
+    return res.status(500).json({ message: 'Error interno del servidor' });
+  }
+}
+
+async function anular(req, res) {
+  try {
+    const { ok, values: v, errors } = V.validate(req.body, anularSchema);
+    if (!ok) return V.sendValidationError(res, errors);
+
+    const item = await pago.anular({ id: req.params.id, usuario_id: req.user.id, motivo: v.motivo });
+    return res.json({ data: toCamelCase(item) });
+  } catch (err) {
+    if (err.message === 'PAGO_NO_ENCONTRADO') {
+      return res.status(404).json({ message: 'Pago no encontrado' });
+    }
+    if (err.message === 'PAGO_YA_ANULADO') {
+      return res.status(409).json({ message: 'Este pago ya fue anulado' });
+    }
+    if (err.message === 'PAGO_NO_ES_ULTIMO') {
+      return res.status(409).json({ message: 'Anulá primero los pagos posteriores de este cliente' });
+    }
+    if (err.message === 'CLIENTE_NO_ENCONTRADO') {
+      return res.status(404).json({ message: 'Cliente no encontrado' });
+    }
+    console.error('pago.anular error:', err);
+    return res.status(500).json({ message: 'Error interno del servidor' });
+  }
+}
+
+async function findAll(req, res) {
+  try {
+    const { ok, values: v, errors } = V.validate(req.query, findAllSchema, { partial: true });
+    if (!ok) return V.sendValidationError(res, errors);
+
+    const page = Number.parseInt(req.query.page, 10) || 1;
+    const pageSize = Math.min(Number.parseInt(req.query.pageSize, 10) || 20, 100);
+    const filtros = {
+      desde: v.desde, hasta: v.hasta, metodo: v.metodo, usuarioId: v.usuarioId,
+      estado: v.estado, clienteQuery: v.clienteQuery,
+    };
+
+    const [data, total] = await Promise.all([
+      pago.findAll({ ...filtros, limit: pageSize, offset: (page - 1) * pageSize }),
+      pago.count(filtros),
+    ]);
+    return res.json({ data: toCamelCase(data), meta: { page, pageSize, total } });
+  } catch (err) {
+    console.error('pago.findAll error:', err);
     return res.status(500).json({ message: 'Error interno del servidor' });
   }
 }
@@ -50,13 +111,11 @@ async function findByCliente(req, res) {
 async function getStats(req, res) {
   try {
     const stats = await pago.getStatsFacturacion();
-    return res.json({
-      data: { hoy: Number(stats.hoy), semana: Number(stats.semana), mes: Number(stats.mes) }
-    });
+    return res.json({ data: stats });
   } catch (err) {
     console.error('pago.getStats error:', err);
     return res.status(500).json({ message: 'Error interno del servidor' });
   }
 }
 
-module.exports = { create, findByCliente, getStats };
+module.exports = { create, anular, findAll, findByCliente, getStats };
