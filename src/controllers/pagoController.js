@@ -1,4 +1,5 @@
 const pago = require('../models/pago');
+const V = require('../utils/validators');
 
 function toCamelCase(obj) {
   if (!obj) return null;
@@ -12,16 +13,20 @@ function toCamelCase(obj) {
   return result;
 }
 
+// El período (desde/hasta) lo calcula el servidor a partir del vencimiento del cliente,
+// por eso el vencimiento resultante nunca puede quedar antes de la fecha de pago.
+const schema = {
+  clienteId: V.uuid('El cliente', { required: true }),
+  monto: V.monto({ required: true }),
+  metodo: V.enumOf('El método de pago', ['efectivo', 'tarjeta', 'transferencia'], { required: true }),
+};
+
 async function create(req, res) {
   try {
-    const { clienteId, monto, metodo } = req.body;
-    if (!clienteId || !monto || !metodo) {
-      return res.status(400).json({ message: 'clienteId, monto y metodo son requeridos' });
-    }
-    if (!['efectivo', 'tarjeta', 'transferencia'].includes(metodo)) {
-      return res.status(400).json({ message: 'Método de pago inválido' });
-    }
-    const item = await pago.create({ cliente_id: clienteId, usuario_id: req.user.id, monto, metodo });
+    const { ok, values: v, errors } = V.validate(req.body, schema);
+    if (!ok) return V.sendValidationError(res, errors);
+
+    const item = await pago.create({ cliente_id: v.clienteId, usuario_id: req.user.id, monto: v.monto, metodo: v.metodo });
     return res.status(201).json({ data: toCamelCase(item) });
   } catch (err) {
     if (err.message === 'CLIENTE_NO_ENCONTRADO') {

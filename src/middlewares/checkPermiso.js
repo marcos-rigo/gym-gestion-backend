@@ -1,6 +1,7 @@
 const { pool } = require('../config/db');
 
-function checkPermiso(permisoRequerido) {
+// checkPermiso('a') exige el permiso; checkPermiso('a', 'b') exige al menos uno de ellos.
+function checkPermiso(...permisosRequeridos) {
   return async (req, res, next) => {
     try {
       const { rows: rolRows } = await pool.query(
@@ -11,12 +12,12 @@ function checkPermiso(permisoRequerido) {
       const { rows } = await pool.query(`
         SELECT 1 FROM linea_permiso lp
         JOIN permisos p ON p.id = lp.id_permiso
-        WHERE lp.id_rol = $1 AND p.descripcion = $2
+        WHERE lp.id_rol = $1 AND p.descripcion = ANY($2)
         LIMIT 1
-      `, [req.user.id_rol, permisoRequerido]);
+      `, [req.user.id_rol, permisosRequeridos]);
 
       if (rows.length === 0) {
-        return res.status(403).json({ message: `No tenés el permiso requerido: ${permisoRequerido}` });
+        return res.status(403).json({ message: `No tenés el permiso requerido: ${permisosRequeridos.join(' o ')}` });
       }
       next();
     } catch (err) {

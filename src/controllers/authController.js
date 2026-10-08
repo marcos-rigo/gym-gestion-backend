@@ -5,18 +5,18 @@ const rol = require('../models/rol');
 
 async function login(req, res) {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
+    const { email, password } = req.body ?? {};
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
       return res.status(400).json({ message: 'Email y contraseña requeridos' });
     }
 
-    const user = await usuario.findByEmail(email);
+    const user = await usuario.findByEmail(email.trim());
     if (!user) return res.status(401).json({ message: 'Credenciales inválidas' });
 
     const valido = await bcrypt.compare(password, user.password_hash);
     if (!valido) return res.status(401).json({ message: 'Credenciales inválidas' });
 
-    const payload = { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol };
+    const payload = { id: user.id, nombre: user.nombre, email: user.email };
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
 
     return res.json({ token, usuario: payload });

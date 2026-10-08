@@ -1,4 +1,6 @@
 const cliente = require('../models/cliente');
+const V = require('../utils/validators');
+const { hoyISO, addDays, PERIODO_DIAS } = require('../config/fechas');
 
 function toCamelCase(obj) {
   if (!obj) return null;
@@ -11,6 +13,25 @@ function toCamelCase(obj) {
   }
   return result;
 }
+
+const MSG_DNI_DUP = 'Ya existe un cliente con ese DNI';
+const MSG_VENC = 'El vencimiento no puede ser anterior al inicio de la cuota';
+
+const schema = {
+  nombre: V.nombre('El nombre', { required: true }),
+  apellido: V.nombre('El apellido', { required: true }),
+  dni: V.dni({ required: true }),
+  fechaNacimiento: V.fechaNacimiento(),
+  telefono: V.telefono(),
+  email: V.email(),
+  direccion: V.texto('La dirección', { max: 200 }),
+  fotoUrl: V.url('La foto'),
+  contactoEmergencia: V.texto('El contacto de emergencia', { max: 100 }),
+  observaciones: V.texto('Las observaciones', { max: 500 }),
+  fechaInicioCuota: V.fecha('La fecha de inicio de cuota'),
+  fechaVencimiento: V.fecha('La fecha de vencimiento'),
+};
+const updateSchema = { ...schema, estado: V.enumOf('El estado', ['activo', 'vencido', 'suspendido']) };
 
 async function getAll(req, res) {
   try {
@@ -35,31 +56,33 @@ async function getById(req, res) {
 
 async function create(req, res) {
   try {
-    const { nombre, apellido, dni } = req.body;
-    if (!nombre || !apellido || !dni) {
-      return res.status(400).json({ message: 'nombre, apellido y dni son requeridos' });
+    const { values: v, errors } = V.validate(req.body, schema);
+    const fechaInicio = v.fechaInicioCuota || hoyISO();
+    const fechaVenc = v.fechaVencimiento || addDays(fechaInicio, PERIODO_DIAS);
+    if (!errors.fechaInicioCuota && !errors.fechaVencimiento && fechaVenc < fechaInicio) {
+      errors.fechaVencimiento = MSG_VENC;
     }
-    const existente = await cliente.findByDNI(dni);
-    if (existente) return res.status(409).json({ message: 'Ya existe un cliente con ese DNI' });
+    if (Object.keys(errors).length > 0) return V.sendValidationError(res, errors);
 
-    const fechaInicio = req.body.fechaInicioCuota || new Date().toISOString().slice(0, 10);
-    const fechaVenc = req.body.fechaVencimiento ||
-      new Date(new Date(fechaInicio).getTime() + 30 * 86400000).toISOString().slice(0, 10);
+    if (await cliente.findByDNI(v.dni)) {
+      return V.sendConflict(res, MSG_DNI_DUP, { dni: MSG_DNI_DUP });
+    }
 
     const item = await cliente.create({
-      nombre, apellido, dni,
-      fecha_nacimiento: req.body.fechaNacimiento,
-      telefono: req.body.telefono,
-      email: req.body.email,
-      direccion: req.body.direccion,
-      foto_url: req.body.fotoUrl,
-      contacto_emergencia: req.body.contactoEmergencia,
-      observaciones: req.body.observaciones,
+      nombre: v.nombre, apellido: v.apellido, dni: v.dni,
+      fecha_nacimiento: v.fechaNacimiento,
+      telefono: v.telefono,
+      email: v.email,
+      direccion: v.direccion,
+      foto_url: v.fotoUrl,
+      contacto_emergencia: v.contactoEmergencia,
+      observaciones: v.observaciones,
       fecha_inicio_cuota: fechaInicio,
       fecha_vencimiento: fechaVenc,
     });
     return res.status(201).json({ data: toCamelCase(item) });
   } catch (err) {
+    if (err.code === '23505') return V.sendConflict(res, MSG_DNI_DUP, { dni: MSG_DNI_DUP });
     console.error('cliente.create error:', err);
     return res.status(500).json({ message: 'Error interno del servidor' });
   }
@@ -70,23 +93,40 @@ async function update(req, res) {
     const existing = await cliente.findById(req.params.id);
     if (!existing) return res.status(404).json({ message: 'Cliente no encontrado' });
 
+    // Los campos no enviados conservan su valor actual; null/'' en un campo opcional lo vacía.
+    const { values: v, errors } = V.validate(req.body, updateSchema, { partial: true });
+    const pick = (key, col) => (v[key] !== undefined ? v[key] : existing[col]);
+    // Las fechas de cuota son NOT NULL: si llegan vacías se conserva la actual.
+    const fechaInicio = v.fechaInicioCuota ?? existing.fecha_inicio_cuota;
+    const fechaVenc = v.fechaVencimiento ?? existing.fecha_vencimiento;
+    if (!errors.fechaInicioCuota && !errors.fechaVencimiento && fechaVenc < fechaInicio) {
+      errors.fechaVencimiento = MSG_VENC;
+    }
+    if (Object.keys(errors).length > 0) return V.sendValidationError(res, errors);
+
+    if (v.dni && v.dni !== existing.dni) {
+      const otro = await cliente.findByDNI(v.dni);
+      if (otro && otro.id !== existing.id) return V.sendConflict(res, MSG_DNI_DUP, { dni: MSG_DNI_DUP });
+    }
+
     const item = await cliente.update(req.params.id, {
-      nombre: req.body.nombre,
-      apellido: req.body.apellido,
-      dni: req.body.dni,
-      fecha_nacimiento: req.body.fechaNacimiento,
-      telefono: req.body.telefono,
-      email: req.body.email,
-      direccion: req.body.direccion,
-      foto_url: req.body.fotoUrl,
-      contacto_emergencia: req.body.contactoEmergencia,
-      observaciones: req.body.observaciones,
-      fecha_inicio_cuota: req.body.fechaInicioCuota ?? existing.fecha_inicio_cuota,
-      fecha_vencimiento: req.body.fechaVencimiento ?? existing.fecha_vencimiento,
-      estado: req.body.estado ?? existing.estado,
+      nombre: pick('nombre', 'nombre'),
+      apellido: pick('apellido', 'apellido'),
+      dni: pick('dni', 'dni'),
+      fecha_nacimiento: pick('fechaNacimiento', 'fecha_nacimiento'),
+      telefono: pick('telefono', 'telefono'),
+      email: pick('email', 'email'),
+      direccion: pick('direccion', 'direccion'),
+      foto_url: pick('fotoUrl', 'foto_url'),
+      contacto_emergencia: pick('contactoEmergencia', 'contacto_emergencia'),
+      observaciones: pick('observaciones', 'observaciones'),
+      fecha_inicio_cuota: fechaInicio,
+      fecha_vencimiento: fechaVenc,
+      estado: v.estado ?? existing.estado,
     });
     return res.json({ data: toCamelCase(item) });
   } catch (err) {
+    if (err.code === '23505') return V.sendConflict(res, MSG_DNI_DUP, { dni: MSG_DNI_DUP });
     console.error('cliente.update error:', err);
     return res.status(500).json({ message: 'Error interno del servidor' });
   }

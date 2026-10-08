@@ -1,15 +1,19 @@
 const { pool } = require('../config/db');
+const { TZ, HOY_SQL, POR_VENCER_DIAS } = require('../config/fechas');
+
+// Única definición del estado de cuota (la usan listados, stats y dashboard).
+const ESTADO_CUOTA_SQL = `CASE
+  WHEN estado != 'activo' THEN NULL
+  WHEN fecha_vencimiento < ${HOY_SQL} THEN 'moroso'
+  WHEN fecha_vencimiento <= ${HOY_SQL} + ${POR_VENCER_DIAS} THEN 'por_vencer'
+  ELSE 'al_dia'
+END`;
+
+const SELECT_CLIENTE = `SELECT *, apellido || ', ' || nombre AS nombre_completo, ${ESTADO_CUOTA_SQL} AS estado_cuota FROM clientes`;
 
 async function findAll() {
   const { rows } = await pool.query(
-    `SELECT *, apellido || ', ' || nombre AS nombre_completo,
-       CASE
-         WHEN estado != 'activo' THEN NULL
-         WHEN fecha_vencimiento < current_date THEN 'moroso'
-         WHEN fecha_vencimiento <= current_date + interval '2 days' THEN 'por_vencer'
-         ELSE 'al_dia'
-       END AS estado_cuota
-     FROM clientes
+    `${SELECT_CLIENTE}
      ORDER BY apellido, nombre`
   );
   return rows;
@@ -17,14 +21,7 @@ async function findAll() {
 
 async function findById(id) {
   const { rows } = await pool.query(
-    `SELECT *, apellido || ', ' || nombre AS nombre_completo,
-       CASE
-         WHEN estado != 'activo' THEN NULL
-         WHEN fecha_vencimiento < current_date THEN 'moroso'
-         WHEN fecha_vencimiento <= current_date + interval '2 days' THEN 'por_vencer'
-         ELSE 'al_dia'
-       END AS estado_cuota
-     FROM clientes WHERE id = $1 LIMIT 1`,
+    `${SELECT_CLIENTE} WHERE id = $1 LIMIT 1`,
     [id]
   );
   return rows[0] ?? null;
@@ -32,14 +29,7 @@ async function findById(id) {
 
 async function findByDNI(dni) {
   const { rows } = await pool.query(
-    `SELECT *, apellido || ', ' || nombre AS nombre_completo,
-       CASE
-         WHEN estado != 'activo' THEN NULL
-         WHEN fecha_vencimiento < current_date THEN 'moroso'
-         WHEN fecha_vencimiento <= current_date + interval '2 days' THEN 'por_vencer'
-         ELSE 'al_dia'
-       END AS estado_cuota
-     FROM clientes WHERE dni = $1 LIMIT 1`,
+    `${SELECT_CLIENTE} WHERE dni = $1 LIMIT 1`,
     [dni]
   );
   return rows[0] ?? null;
@@ -87,26 +77,23 @@ async function remove(id) {
 async function getStats() {
   const { rows } = await pool.query(`
     SELECT
-      COUNT(*) AS total,
-      COUNT(*) FILTER (WHERE estado = 'activo') AS activos,
-      COUNT(*) FILTER (WHERE estado = 'activo' AND fecha_vencimiento < current_date) AS morosos,
-      COUNT(*) FILTER (WHERE estado = 'activo' AND fecha_vencimiento >= current_date AND fecha_vencimiento <= current_date + interval '7 days') AS por_vencer,
-      COUNT(*) FILTER (WHERE date_trunc('month', created_at) = date_trunc('month', current_date)) AS nuevos_mes
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE estado = 'activo')::int AS activos,
+      COUNT(*) FILTER (WHERE ${ESTADO_CUOTA_SQL} = 'moroso')::int AS morosos,
+      COUNT(*) FILTER (WHERE ${ESTADO_CUOTA_SQL} = 'por_vencer')::int AS por_vencer,
+      COUNT(*) FILTER (WHERE date_trunc('month', created_at AT TIME ZONE '${TZ}') = date_trunc('month', ${HOY_SQL}))::int AS nuevos_mes
     FROM clientes
   `);
   return rows[0];
 }
 
+// Clientes activos vencidos o por vencer, los más urgentes (vencimiento más antiguo) primero.
 async function getProximosVencimientos(limit = 10) {
   const { rows } = await pool.query(`
     SELECT id, apellido || ', ' || nombre AS nombre_completo, telefono, fecha_vencimiento,
-      CASE
-        WHEN fecha_vencimiento < current_date THEN 'moroso'
-        WHEN fecha_vencimiento <= current_date + interval '2 days' THEN 'por_vencer'
-        ELSE 'al_dia'
-      END AS estado_cuota
+      ${ESTADO_CUOTA_SQL} AS estado_cuota
     FROM clientes
-    WHERE estado = 'activo' AND fecha_vencimiento <= current_date + interval '7 days'
+    WHERE ${ESTADO_CUOTA_SQL} IN ('moroso', 'por_vencer')
     ORDER BY fecha_vencimiento ASC
     LIMIT $1
   `, [limit]);

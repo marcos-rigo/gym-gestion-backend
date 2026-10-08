@@ -1,0 +1,757 @@
+// Suite exhaustiva. Se ejecuta con `npm test` y reutiliza el arranque/limpieza de smoke-test.js
+// (que ya registra sus propios tests): matriz de permisos por endpoint, bordes de la cuota,
+// atomicidad de transacciones, reglas de usuarios/roles, upload real y números de stats.
+//
+// Los tests marcados "en proceso" parchean módulos o el pool, así que se saltean con TEST_BASE_URL.
+
+const { describe, it, before } = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const jwt = require('jsonwebtoken');
+const { createClient } = require('@supabase/supabase-js');
+
+const H = require('./smoke-test'); // registra la suite base y sus hooks before/after
+const { api, login, dbUser, dbRole, crearCliente, assertErrores, ctx, randLetters, randDni, testEmail, clienteBase, PASSWORD, external } = H;
+
+const { pool } = require('../src/config/db');
+const { hoyISO, addDays, POR_VENCER_DIAS, TZ } = require('../src/config/fechas');
+const usuarioModel = require('../src/models/usuario');
+const clienteModel = require('../src/models/cliente');
+
+const inproc = { skip: external && 'requiere app en proceso' };
+const uuid = () => crypto.randomUUID();
+const hoy = () => hoyISO();
+const cents = (n) => Math.round(Number(n) * 100);
+
+// Registro de archivos subidos para borrarlos de Storage al final.
+const uploads = [];
+const { after } = require('node:test');
+after(async () => {
+  if (uploads.length === 0) return;
+  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { realtime: { transport: require('ws') } });
+  const names = uploads.map((u) => decodeURIComponent(new URL(u).pathname.split('/').pop()));
+  const { error } = await sb.storage.from('fotos-clientes').remove(names);
+  if (error) console.error('cleanup storage:', error.message);
+});
+
+// Hace fallar (con una excepción) toda query del cliente de transacción que coincida con `match`.
+async function conFallo(match, fn) {
+  const own = Object.prototype.hasOwnProperty.call(pool, 'connect');
+  const orig = pool.connect;
+  const parcheados = [];
+  pool.connect = async function patched(...args) {
+    const c = await orig.apply(this, args);
+    if (args.length === 0) {
+      const q = c.query.bind(c);
+      c.query = (sql, ...rest) => (typeof sql === 'string' && match.test(sql) ? Promise.reject(new Error('FALLA_INDUCIDA')) : q(sql, ...rest));
+      parcheados.push(c);
+    }
+    return c;
+  };
+  try {
+    return await fn();
+  } finally {
+    if (own) pool.connect = orig; else delete pool.connect;
+    // los clientes vuelven al pool: hay que quitarles el parche o contaminan las pruebas siguientes
+    for (const c of parcheados) delete c.query;
+  }
+}
+
+async function conAdmins(n, fn) {
+  const orig = usuarioModel.countAdminsActivos;
+  usuarioModel.countAdminsActivos = async () => n;
+  try { return await fn(); } finally { usuarioModel.countAdminsActivos = orig; }
+}
+
+async function cobrar(token, clienteId, monto = 100, metodo = 'efectivo') {
+  return api('POST', '/api/pagos', { token, body: { clienteId, monto, metodo } });
+}
+const getCliente = async (id) => (await api('GET', `/api/clientes/${id}`, { token: ctx.admin })).body.data;
+const statsDash = async () => (await api('GET', '/api/dashboard/stats', { token: ctx.admin })).body.data;
+const statsPagos = async () => (await api('GET', '/api/pagos/stats', { token: ctx.admin })).body.data;
+
+async function sqlCliente({ vencimiento, estado = 'activo', createdAt = null }) {
+  const { rows } = await pool.query(
+    `INSERT INTO clientes (nombre, apellido, dni, email, observaciones, fecha_inicio_cuota, fecha_vencimiento, estado, created_at)
+     VALUES ('Sembrado','Sql',$1,$2,$3,$4::date - 30,$4::date,$5,COALESCE($6::timestamptz, now())) RETURNING id`,
+    [randDni(), testEmail('sql'), `TEST_${randLetters()}`, vencimiento, estado, createdAt]
+  );
+  ctx.ids.clientes.push(rows[0].id);
+  return rows[0].id;
+}
+
+async function seedPago(clienteId, fechaLocal, monto) {
+  await pool.query(
+    `INSERT INTO pagos (cliente_id, usuario_id, monto, metodo, periodo_desde, periodo_hasta, fecha_pago)
+     VALUES ($1,$2,$3,'efectivo',$4::date,$4::date + 30,(($4::date + time '12:00') AT TIME ZONE $5))`,
+    [clienteId, ctx.adminId, monto, fechaLocal, TZ]
+  );
+}
+
+// ───────────────────────── 401: tokens inválidos en TODOS los endpoints ─────────────────────────
+describe('401 en todos los endpoints', () => {
+  const id = uuid();
+  const rutas = [
+    ['GET', '/api/auth/mis-permisos'],
+    ['GET', '/api/clientes'], ['GET', `/api/clientes/${id}`], ['POST', '/api/clientes'], ['PUT', `/api/clientes/${id}`], ['DELETE', `/api/clientes/${id}`],
+    ['GET', '/api/roles'], ['GET', '/api/roles/permisos'], ['POST', '/api/roles'], ['PUT', `/api/roles/${id}`], ['DELETE', `/api/roles/${id}`],
+    ['POST', '/api/pagos'], ['GET', `/api/pagos/cliente/${id}`], ['GET', '/api/pagos/stats'],
+    ['GET', '/api/dashboard/stats'], ['POST', '/api/upload/foto'],
+    ['GET', '/api/usuarios'], ['POST', '/api/usuarios'], ['PUT', `/api/usuarios/${id}`], ['PATCH', `/api/usuarios/${id}/toggle-activo`], ['DELETE', `/api/usuarios/${id}`],
+  ];
+
+  it('sin header, esquema incorrecto, firma ajena, expirado y usuario inexistente', async () => {
+    const firmado = (payload, secret = process.env.JWT_SECRET, opts = { expiresIn: '1h' }) => jwt.sign(payload, secret, opts);
+    const tokens = {
+      ajeno: firmado({ id: ctx.adminId }, 'otro-secreto'),
+      expirado: firmado({ id: ctx.adminId }, process.env.JWT_SECRET, { expiresIn: -10 }),
+      fantasma: firmado({ id: uuid(), email: 'x@x.com' }), // firma válida pero el usuario no existe
+      hs512: jwt.sign({ id: ctx.adminId }, process.env.JWT_SECRET, { algorithm: 'HS512' }),
+    };
+    for (const [m, p] of rutas) {
+      assert.equal((await api(m, p)).status, 401, `${m} ${p} sin token`);
+      assert.equal((await api(m, p, { headers: { Authorization: `Basic ${ctx.admin}` } })).status, 401, `${m} ${p} esquema Basic`);
+      for (const [nombre, t] of Object.entries(tokens)) {
+        assert.equal((await api(m, p, { token: t })).status, 401, `${m} ${p} token ${nombre}`);
+      }
+    }
+  });
+});
+
+// ───────────────────────── Matriz de permisos ─────────────────────────
+describe('matriz de permisos por endpoint', () => {
+  let ALL;
+  const tokens = new Map();
+
+  before(async () => {
+    ALL = (await pool.query('SELECT descripcion FROM permisos ORDER BY descripcion')).rows.map((r) => r.descripcion);
+  });
+
+  async function tokenCon(perms) {
+    const key = [...perms].sort().join(',');
+    if (!tokens.has(key)) {
+      const rolId = await dbRole(`Zztest${randLetters()}`, perms);
+      const email = testEmail('perm');
+      await dbUser({ nombre: 'Perm Prueba', email, idRol: rolId });
+      tokens.set(key, await login(email));
+    }
+    return tokens.get(key);
+  }
+
+  // `perms`: cualquiera de ellos alcanza. `ok`: status esperado cuando SÍ tiene permiso
+  // (se eligen requests que fallan por validación/404 para no mutar datos).
+  const casos = [
+    { perms: ['clientes_ver'], m: 'GET', p: () => '/api/clientes', ok: 200 },
+    { perms: ['clientes_ver'], m: 'GET', p: () => `/api/clientes/${uuid()}`, ok: 404 },
+    { perms: ['clientes_crear'], m: 'POST', p: () => '/api/clientes', body: {}, ok: 400 },
+    { perms: ['clientes_editar'], m: 'PUT', p: () => `/api/clientes/${uuid()}`, body: {}, ok: 404 },
+    { perms: ['clientes_eliminar'], m: 'DELETE', p: () => `/api/clientes/${uuid()}`, ok: 404 },
+    { perms: ['roles_ver'], m: 'GET', p: () => '/api/roles', ok: 200 },
+    { perms: ['roles_ver'], m: 'GET', p: () => '/api/roles/permisos', ok: 200 },
+    { perms: ['roles_crear'], m: 'POST', p: () => '/api/roles', body: {}, ok: 400 },
+    { perms: ['roles_editar'], m: 'PUT', p: () => `/api/roles/${uuid()}`, body: {}, ok: 404 },
+    { perms: ['roles_eliminar'], m: 'DELETE', p: () => `/api/roles/${uuid()}`, ok: 404 },
+    { perms: ['facturacion_cobrar'], m: 'POST', p: () => '/api/pagos', body: {}, ok: 400 },
+    { perms: ['facturacion_ver'], m: 'GET', p: () => `/api/pagos/cliente/${uuid()}`, ok: 200 },
+    { perms: ['facturacion_ver'], m: 'GET', p: () => '/api/pagos/stats', ok: 200 },
+    { perms: ['estadisticas_ver'], m: 'GET', p: () => '/api/dashboard/stats', ok: 200 },
+    { perms: ['clientes_crear', 'clientes_editar'], m: 'POST', p: () => '/api/upload/foto', ok: 400 },
+  ];
+
+  for (const c of casos) {
+    const nombre = `${c.m} ${c.p().replace(/[0-9a-f-]{36}/, ':id')} (${c.perms.join(' | ')})`;
+
+    it(`${nombre}: con el permiso pasa`, async () => {
+      for (const perm of c.perms) {
+        const t = await tokenCon([perm]);
+        const r = await api(c.m, c.p(), { token: t, body: c.body });
+        assert.equal(r.status, c.ok, `solo con ${perm}: ${r.text}`);
+      }
+    });
+
+    it(`${nombre}: sin el permiso -> 403 (aunque tenga todos los demás)`, async () => {
+      const t = await tokenCon(ALL.filter((p) => !c.perms.includes(p)));
+      const r = await api(c.m, c.p(), { token: t, body: c.body });
+      assert.equal(r.status, 403, r.text);
+      assert.match(r.body.message, /permiso/i);
+    });
+
+    it(`${nombre}: sin ningún permiso -> 403`, async () => {
+      const t = await tokenCon([]);
+      assert.equal((await api(c.m, c.p(), { token: t, body: c.body })).status, 403);
+    });
+  }
+
+  it('el Admin pasa todos los chequeos de permiso sin tenerlos asignados', async () => {
+    for (const c of casos) {
+      const r = await api(c.m, c.p(), { token: ctx.admin, body: c.body });
+      assert.equal(r.status, c.ok, `${c.m} ${c.p()}: ${r.text}`);
+    }
+  });
+
+  it('requireDueno (/api/usuarios): Admin y Dueño pasan; un rol con TODOS los permisos pero que no es Dueño, no', async () => {
+    const sinDueno = await tokenCon(ALL);
+    const reqs = [['GET', '/api/usuarios'], ['POST', '/api/usuarios', {}], ['PUT', `/api/usuarios/${uuid()}`, {}],
+      ['PATCH', `/api/usuarios/${uuid()}/toggle-activo`], ['DELETE', `/api/usuarios/${uuid()}`]];
+    for (const [m, p, body] of reqs) {
+      assert.equal((await api(m, p, { token: sinDueno, body })).status, 403, `${m} ${p} con todos los permisos`);
+      assert.equal((await api(m, p, { token: ctx.limitado, body })).status, 403, `${m} ${p} limitado`);
+    }
+    const esperado = { GET: 200, POST: 400, PUT: 400, PATCH: 404, DELETE: 404 };
+    for (const [m, p, body] of reqs) {
+      assert.equal((await api(m, p, { token: ctx.admin, body })).status, esperado[m], `admin ${m} ${p}`);
+      if (ctx.dueno) assert.equal((await api(m, p, { token: ctx.dueno, body })).status, esperado[m], `dueño ${m} ${p}`);
+    }
+  });
+});
+
+// ───────────────────────── Cuota: estados en los bordes ─────────────────────────
+describe('estado de cuota en los bordes', () => {
+  const offsets = [...new Set([-1, 0, 1, 2, 3, POR_VENCER_DIAS, POR_VENCER_DIAS + 1])].sort((a, b) => a - b);
+  const esperado = (d) => (d < 0 ? 'moroso' : d <= POR_VENCER_DIAS ? 'por_vencer' : 'al_dia');
+
+  for (const d of offsets) {
+    it(`vence en ${d} días -> ${esperado(d)} (alta, get por id y listado coinciden)`, async () => {
+      const venc = addDays(hoy(), d);
+      const c = await crearCliente({ fechaInicioCuota: addDays(venc, -30), fechaVencimiento: venc });
+      assert.equal(c.estadoCuota, esperado(d), 'alta');
+      assert.equal((await getCliente(c.id)).estadoCuota, esperado(d), 'get por id');
+      const lista = (await api('GET', '/api/clientes', { token: ctx.admin })).body.data;
+      assert.equal(lista.find((x) => x.id === c.id).estadoCuota, esperado(d), 'listado');
+    });
+  }
+
+  it('hoy mismo NO es moroso: vence hoy = por_vencer', async () => {
+    const c = await crearCliente({ fechaInicioCuota: addDays(hoy(), -30), fechaVencimiento: hoy() });
+    assert.equal(c.estadoCuota, 'por_vencer');
+  });
+
+  it('cambiar estado a suspendido/vencido anula el estado de cuota; volver a activo lo recalcula', async () => {
+    const c = await crearCliente({ fechaInicioCuota: addDays(hoy(), -40), fechaVencimiento: addDays(hoy(), -2) });
+    for (const estado of ['suspendido', 'vencido']) {
+      const r = await api('PUT', `/api/clientes/${c.id}`, { token: ctx.admin, body: { estado } });
+      assert.equal(r.body.data.estadoCuota, null, estado);
+    }
+    const back = await api('PUT', `/api/clientes/${c.id}`, { token: ctx.admin, body: { estado: 'activo' } });
+    assert.equal(back.body.data.estadoCuota, 'moroso');
+  });
+
+  it('editar la fecha de vencimiento recalcula el estado', async () => {
+    const c = await crearCliente({ fechaInicioCuota: addDays(hoy(), -40), fechaVencimiento: addDays(hoy(), -2) });
+    const r = await api('PUT', `/api/clientes/${c.id}`, { token: ctx.admin, body: { fechaVencimiento: addDays(hoy(), 60) } });
+    assert.equal(r.body.data.estadoCuota, 'al_dia');
+  });
+});
+
+// ───────────────────────── Cobro: encadenado, concurrencia y atomicidad ─────────────────────────
+describe('cobro: encadenado de vencimiento', () => {
+  const casos = [
+    ['vencido hace 5 días: arranca hoy', -5, () => hoy()],
+    ['vence ayer: arranca hoy', -1, () => hoy()],
+    ['vence hoy: arranca hoy', 0, () => hoy()],
+    ['vence mañana: arranca mañana', 1, () => addDays(hoy(), 1)],
+    ['vence en 20 días: arranca en 20 días', 20, () => addDays(hoy(), 20)],
+  ];
+  for (const [titulo, d, desde] of casos) {
+    it(titulo, async () => {
+      const venc = addDays(hoy(), d);
+      const c = await crearCliente({ fechaInicioCuota: addDays(venc, -30), fechaVencimiento: venc });
+      const r = await cobrar(ctx.admin, c.id, 999.99, 'transferencia');
+      assert.equal(r.status, 201, r.text);
+      assert.equal(r.body.data.periodoDesde, desde());
+      assert.equal(r.body.data.periodoHasta, addDays(desde(), 30));
+      assert.equal(r.body.data.metodo, 'transferencia');
+      assert.equal(cents(r.body.data.monto), 99999);
+      const cli = await getCliente(c.id);
+      assert.equal(cli.fechaInicioCuota, desde());
+      assert.equal(cli.fechaVencimiento, addDays(desde(), 30));
+      assert.equal(cli.estado, 'activo');
+    });
+  }
+
+  it('dos cobros seguidos se encadenan (+30 y +60)', async () => {
+    const c = await crearCliente({ fechaInicioCuota: addDays(hoy(), -40), fechaVencimiento: addDays(hoy(), -10) });
+    const a = await cobrar(ctx.admin, c.id);
+    const b = await cobrar(ctx.admin, c.id);
+    assert.equal(b.body.data.periodoDesde, a.body.data.periodoHasta);
+    assert.equal((await getCliente(c.id)).fechaVencimiento, addDays(hoy(), 60));
+    const hist = (await api('GET', `/api/pagos/cliente/${c.id}`, { token: ctx.admin })).body.data;
+    assert.equal(hist.length, 2);
+    assert.ok(hist[0].fechaPago >= hist[1].fechaPago, 'historial ordenado del más reciente al más antiguo');
+  });
+
+  it('cobrar a un cliente "vencido" lo reactiva', async () => {
+    const c = await crearCliente();
+    await api('PUT', `/api/clientes/${c.id}`, { token: ctx.admin, body: { estado: 'vencido' } });
+    await cobrar(ctx.admin, c.id);
+    assert.equal((await getCliente(c.id)).estado, 'activo');
+  });
+
+  it('dos cobros simultáneos no se pisan (lock FOR UPDATE)', async () => {
+    const base = addDays(hoy(), 3);
+    const c = await crearCliente({ fechaInicioCuota: addDays(base, -30), fechaVencimiento: base });
+    const [a, b] = await Promise.all([cobrar(ctx.admin, c.id), cobrar(ctx.admin, c.id)]);
+    assert.equal(a.status, 201, a.text);
+    assert.equal(b.status, 201, b.text);
+    assert.deepEqual([a.body.data.periodoDesde, b.body.data.periodoDesde].sort(), [base, addDays(base, 30)]);
+    assert.equal((await getCliente(c.id)).fechaVencimiento, addDays(base, 60));
+  });
+
+  it('el cobro guarda el usuario que lo registró y es consultable por cliente', async () => {
+    const c = await crearCliente();
+    const r = await cobrar(ctx.admin, c.id, '12.5');
+    assert.equal(r.body.data.usuarioId, ctx.adminId);
+    assert.equal(cents(r.body.data.monto), 1250);
+    const hist = await api('GET', `/api/pagos/cliente/${c.id}`, { token: ctx.limitado });
+    assert.equal(hist.status, 403);
+  });
+
+  it('historial de un cliente inexistente devuelve lista vacía', async () => {
+    const r = await api('GET', `/api/pagos/cliente/${uuid()}`, { token: ctx.admin });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.data, []);
+  });
+
+  it('en proceso: si falla el UPDATE del cliente, el pago insertado se revierte (atomicidad)', inproc, async () => {
+    const venc = addDays(hoy(), 5);
+    const c = await crearCliente({ fechaInicioCuota: addDays(venc, -30), fechaVencimiento: venc });
+    const r = await conFallo(/UPDATE clientes SET fecha_vencimiento/, () => cobrar(ctx.admin, c.id, 500));
+    assert.equal(r.status, 500, r.text);
+    assert.equal(r.body.message, 'Error interno del servidor');
+    const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM pagos WHERE cliente_id = $1', [c.id]);
+    assert.equal(rows[0].n, 0, 'no debe quedar el pago huérfano');
+    assert.equal((await getCliente(c.id)).fechaVencimiento, venc, 'el vencimiento no cambió');
+    // control: sin falla inducida, el mismo cobro funciona (y el pool quedó sano tras el rollback)
+    assert.equal((await cobrar(ctx.admin, c.id, 500)).status, 201);
+    assert.equal((await getCliente(c.id)).fechaVencimiento, addDays(venc, 30));
+  });
+
+  it('en proceso: si falla el INSERT del pago, el cliente queda intacto', inproc, async () => {
+    const venc = addDays(hoy(), -4);
+    const c = await crearCliente({ fechaInicioCuota: addDays(venc, -30), fechaVencimiento: venc });
+    const r = await conFallo(/INSERT INTO pagos/, () => cobrar(ctx.admin, c.id));
+    assert.equal(r.status, 500);
+    assert.equal((await getCliente(c.id)).fechaVencimiento, venc);
+  });
+});
+
+// ───────────────────────── Roles: atomicidad, 409 y reglas ─────────────────────────
+describe('roles: reglas adicionales', () => {
+  it('en proceso: crear rol con falla al asignar permisos no deja un rol huérfano', inproc, async () => {
+    const nombre = `Zztest${randLetters()}`;
+    const r = await conFallo(/INSERT INTO linea_permiso/, () =>
+      api('POST', '/api/roles', { token: ctx.admin, body: { descripcion: nombre, permissions: ['clientes_ver'] } }));
+    assert.equal(r.status, 500);
+    const { rows } = await pool.query('SELECT 1 FROM roles WHERE descripcion = $1', [nombre]);
+    assert.equal(rows.length, 0);
+  });
+
+  it('en proceso: si falla la sincronización de permisos, el rol conserva los anteriores', inproc, async () => {
+    const rolId = await dbRole(`Zztest${randLetters()}`, ['clientes_ver', 'clientes_crear']);
+    const r = await conFallo(/INSERT INTO linea_permiso/, () =>
+      api('PUT', `/api/roles/${rolId}`, { token: ctx.admin, body: { permissions: ['facturacion_ver'] } }));
+    assert.equal(r.status, 500);
+    const { rows } = await pool.query(
+      'SELECT p.descripcion FROM linea_permiso lp JOIN permisos p ON p.id = lp.id_permiso WHERE lp.id_rol = $1 ORDER BY 1', [rolId]);
+    assert.deepEqual(rows.map((x) => x.descripcion), ['clientes_crear', 'clientes_ver']);
+  });
+
+  it('PUT con descripción de otro rol -> 409; con la propia descripción -> 200', async () => {
+    const a = `Zztest${randLetters()}`;
+    const b = `Zztest${randLetters()}`;
+    const ra = await api('POST', '/api/roles', { token: ctx.admin, body: { descripcion: a } });
+    const rb = await api('POST', '/api/roles', { token: ctx.admin, body: { descripcion: b } });
+    ctx.ids.roles.push(ra.body.data.id, rb.body.data.id);
+    const dup = await api('PUT', `/api/roles/${rb.body.data.id}`, { token: ctx.admin, body: { descripcion: a } });
+    assert.equal(dup.status, 409, dup.text);
+    assert.ok(dup.body.errors.descripcion);
+    const mismo = await api('PUT', `/api/roles/${rb.body.data.id}`, { token: ctx.admin, body: { descripcion: b } });
+    assert.equal(mismo.status, 200, mismo.text);
+  });
+
+  it('PUT con permissions null/[] vacía los permisos; sin el campo no los toca', async () => {
+    const rolId = await dbRole(`Zztest${randLetters()}`, ['clientes_ver']);
+    const sinCampo = await api('PUT', `/api/roles/${rolId}`, { token: ctx.admin, body: { descripcion: `Zztest${randLetters()}` } });
+    assert.deepEqual(sinCampo.body.data.permissions, ['clientes_ver']);
+    const vacio = await api('PUT', `/api/roles/${rolId}`, { token: ctx.admin, body: { permissions: [] } });
+    assert.deepEqual(vacio.body.data.permissions, []);
+  });
+
+  it('PUT / POST validan tipos y descripción', async () => {
+    const rolId = await dbRole(`Zztest${randLetters()}`, []);
+    assertErrores(await api('PUT', `/api/roles/${rolId}`, { token: ctx.admin, body: { descripcion: 'X' } }), ['descripcion']);
+    assertErrores(await api('PUT', `/api/roles/${rolId}`, { token: ctx.admin, body: { descripcion: '' } }), ['descripcion']);
+    assertErrores(await api('PUT', `/api/roles/${rolId}`, { token: ctx.admin, body: { permissions: [1, 2] } }), ['permissions']);
+    assertErrores(await api('POST', '/api/roles', { token: ctx.admin, body: { descripcion: 'x'.repeat(51) } }), ['descripcion']);
+  });
+
+  it('el listado muestra userCount (activos) y assignedCount (todos) como números; Admin lista todos los permisos', async () => {
+    const rolId = await dbRole(`Zztest${randLetters()}`, []);
+    await dbUser({ nombre: 'Rol Activo', email: testEmail('ra'), idRol: rolId });
+    await dbUser({ nombre: 'Rol Inactivo', email: testEmail('ri'), idRol: rolId, activo: false });
+    const lista = (await api('GET', '/api/roles', { token: ctx.admin })).body.data;
+    const r = lista.find((x) => x.id === rolId);
+    assert.equal(r.userCount, 1);
+    assert.equal(r.assignedCount, 2);
+    const todos = (await api('GET', '/api/roles/permisos', { token: ctx.admin })).body.data;
+    assert.deepEqual(lista.find((x) => x.esAdmin).permissions, todos);
+  });
+
+  it('mis-permisos: Admin recibe todos; un rol recibe solo los suyos; permisos en tiempo real', async () => {
+    const todos = (await api('GET', '/api/roles/permisos', { token: ctx.admin })).body.data;
+    const a = await api('GET', '/api/auth/mis-permisos', { token: ctx.admin });
+    assert.deepEqual(a.body.data.permissions, todos);
+    assert.equal(a.body.data.esAdmin, true);
+  });
+});
+
+// ───────────────────────── Usuarios: reglas de seguridad ─────────────────────────
+describe('usuarios: último Admin, Dueño y superadmin', () => {
+  const mkAdmin = async (tag) => {
+    const email = testEmail(tag);
+    const id = await dbUser({ nombre: 'Admin Extra', email, idRol: ctx.adminRolId });
+    return { id, email };
+  };
+  const estado = async (id) => (await pool.query('SELECT activo, id_rol FROM usuarios WHERE id = $1', [id])).rows[0];
+
+  it('countAdminsActivos cuenta solo Admins activos', async () => {
+    const { id } = await mkAdmin('cnt');
+    const antes = await usuarioModel.countAdminsActivos();
+    await pool.query('UPDATE usuarios SET activo = false WHERE id = $1', [id]);
+    assert.equal(await usuarioModel.countAdminsActivos(), antes - 1);
+    assert.equal(typeof antes, 'number');
+  });
+
+  it('en proceso: con un único Admin activo no se lo puede desactivar, eliminar ni degradar', inproc, async () => {
+    const t = await mkAdmin('ultimo');
+    await conAdmins(1, async () => {
+      const toggle = await api('PATCH', `/api/usuarios/${t.id}/toggle-activo`, { token: ctx.admin });
+      assert.equal(toggle.status, 403, toggle.text);
+      assert.match(toggle.body.message, /único Admin/);
+      const del = await api('DELETE', `/api/usuarios/${t.id}`, { token: ctx.admin });
+      assert.equal(del.status, 403, del.text);
+      assert.match(del.body.message, /único Admin/);
+      const demote = await api('PUT', `/api/usuarios/${t.id}`, { token: ctx.admin, body: { nombre: 'Admin Extra', email: t.email, idRol: ctx.limitadoRolId } });
+      assert.equal(demote.status, 403, demote.text);
+      assert.match(demote.body.message, /único Admin/);
+    });
+    assert.deepEqual(await estado(t.id), { activo: true, id_rol: ctx.adminRolId }, 'no se modificó nada');
+  });
+
+  it('en proceso: con más de un Admin activo sí se puede desactivar, degradar y eliminar', inproc, async () => {
+    const a = await mkAdmin('dos_a');
+    const b = await mkAdmin('dos_b');
+    await conAdmins(2, async () => {
+      const off = await api('PATCH', `/api/usuarios/${a.id}/toggle-activo`, { token: ctx.admin });
+      assert.equal(off.status, 200, off.text);
+      const demote = await api('PUT', `/api/usuarios/${b.id}`, { token: ctx.admin, body: { nombre: 'Admin Extra', email: b.email, idRol: ctx.limitadoRolId } });
+      assert.equal(demote.status, 200, demote.text);
+    });
+    // un Admin inactivo se puede borrar aunque quede un solo Admin activo
+    await conAdmins(1, async () => {
+      assert.equal((await api('DELETE', `/api/usuarios/${a.id}`, { token: ctx.admin })).status, 200);
+    });
+  });
+
+  it('un Admin puede cambiar su propio rol a otro Admin / editar su nombre sin restricciones del último Admin', async () => {
+    const t = await mkAdmin('self');
+    const tok = await login(t.email);
+    const r = await api('PUT', `/api/usuarios/${t.id}`, { token: tok, body: { nombre: 'Admin Renombrado', email: t.email, idRol: ctx.adminRolId } });
+    assert.equal(r.status, 200, r.text);
+  });
+
+  it('Dueño: gestiona usuarios comunes pero nunca Admins', async (tt) => {
+    if (!ctx.dueno) return tt.skip('no existe el rol Dueño');
+    const D = ctx.dueno;
+    const email = testEmail('porDueno');
+
+    // puede: alta, edición, desactivar/activar y borrar un usuario común
+    const c = await api('POST', '/api/usuarios', { token: D, body: { nombre: 'Creado Dueno', email, password: PASSWORD, idRol: ctx.limitadoRolId } });
+    assert.equal(c.status, 201, c.text);
+    ctx.ids.usuarios.push(c.body.data.id);
+    const uid = c.body.data.id;
+    assert.equal((await api('PUT', `/api/usuarios/${uid}`, { token: D, body: { nombre: 'Editado Dueno', email, idRol: ctx.sinPermisosRolId } })).status, 200);
+    assert.equal((await api('PATCH', `/api/usuarios/${uid}/toggle-activo`, { token: D })).status, 200);
+
+    // no puede: crear Admin, ascender a Admin, ni tocar a un Admin (editar/desactivar/borrar)
+    const admin = await mkAdmin('objetivo');
+    const crearAdmin = await api('POST', '/api/usuarios', { token: D, body: { nombre: 'Falso Admin', email: testEmail('f'), password: PASSWORD, idRol: ctx.adminRolId } });
+    assert.equal(crearAdmin.status, 403, crearAdmin.text);
+    assert.equal((await api('PUT', `/api/usuarios/${uid}`, { token: D, body: { nombre: 'Editado Dueno', email, idRol: ctx.adminRolId } })).status, 403);
+    assert.equal((await api('PUT', `/api/usuarios/${admin.id}`, { token: D, body: { nombre: 'Hackeado', email: admin.email, idRol: ctx.limitadoRolId } })).status, 403);
+    assert.equal((await api('PATCH', `/api/usuarios/${admin.id}/toggle-activo`, { token: D })).status, 403);
+    assert.equal((await api('DELETE', `/api/usuarios/${admin.id}`, { token: D })).status, 403);
+    assert.deepEqual(await estado(admin.id), { activo: true, id_rol: ctx.adminRolId });
+
+    assert.equal((await api('DELETE', `/api/usuarios/${uid}`, { token: D })).status, 200);
+  });
+
+  it('en proceso: el superadmin protegido no cambia por ninguna vía (ni siquiera con Dueño)', inproc, async () => {
+    const id = ctx.protegidoId;
+    const antes = (await pool.query('SELECT nombre, email, id_rol, activo FROM usuarios WHERE id = $1', [id])).rows[0];
+    const tokens = [ctx.admin, ...(ctx.dueno ? [ctx.dueno] : [])];
+    for (const token of tokens) {
+      const put = await api('PUT', `/api/usuarios/${id}`, { token, body: { nombre: 'Otro Nombre', email: antes.email, idRol: ctx.limitadoRolId } });
+      assert.equal(put.status, 403, put.text);
+      assert.match(put.body.message, /protegido/);
+      const off = await api('PATCH', `/api/usuarios/${id}/toggle-activo`, { token });
+      assert.equal(off.status, 403);
+      assert.match(off.body.message, /protegido/);
+      const del = await api('DELETE', `/api/usuarios/${id}`, { token });
+      assert.equal(del.status, 403);
+      assert.match(del.body.message, /protegido/);
+    }
+    assert.deepEqual((await pool.query('SELECT nombre, email, id_rol, activo FROM usuarios WHERE id = $1', [id])).rows[0], antes);
+    // nadie puede crear otro usuario con el email protegido
+    const dup = await api('POST', '/api/usuarios', { token: ctx.admin, body: { nombre: 'Clon', email: H.protectedEmail.toUpperCase(), password: PASSWORD, idRol: ctx.limitadoRolId } });
+    assert.equal(dup.status, 409);
+    const lista = (await api('GET', '/api/usuarios', { token: ctx.admin })).body.data;
+    assert.equal(lista.filter((u) => u.protegido).length, 1);
+  });
+
+  it('los usuarios inactivos no pueden operar, ni siquiera /api/usuarios', async () => {
+    const t = await mkAdmin('inact');
+    const tok = await login(t.email);
+    await pool.query('UPDATE usuarios SET activo = false WHERE id = $1', [t.id]);
+    assert.equal((await api('GET', '/api/usuarios', { token: tok })).status, 401);
+    assert.equal((await api('GET', '/api/clientes', { token: tok })).status, 401);
+  });
+});
+
+// ───────────────────────── Upload real ─────────────────────────
+describe('upload de fotos: casos completos', () => {
+  const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+  const subir = (token, { bytes = PNG, type = 'image/png', filename = 'foto.png', field = 'foto' } = {}) => {
+    const f = new FormData();
+    f.append(field, new Blob([bytes], { type }), filename);
+    return fetch(`${H.getBaseUrl()}/api/upload/foto`, { method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {}, body: f });
+  };
+  const nombreEn = (url) => decodeURIComponent(new URL(url).pathname.split('/').pop());
+
+  it('sin token -> 401, también con archivo válido', async () => {
+    assert.equal((await subir(null)).status, 401);
+  });
+
+  it('token válido sube una imagen PNG y devuelve una URL pública accesible', async () => {
+    const res = await subir(ctx.admin);
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+    uploads.push(body.url);
+    assert.match(body.url, /^https:\/\//);
+    assert.match(nombreEn(body.url), /^\d+-[0-9a-f-]{36}\.png$/);
+    const get = await fetch(body.url);
+    assert.equal(get.status, 200);
+    assert.match(get.headers.get('content-type'), /image\/png/);
+  });
+
+  it('acepta jpeg y webp; el nombre del archivo del cliente no llega al path', async () => {
+    for (const [type, ext] of [['image/jpeg', 'jpg'], ['image/webp', 'webp']]) {
+      const res = await subir(ctx.admin, { type, filename: '../../evil name.exe' });
+      const body = await res.json();
+      assert.equal(res.status, 200, JSON.stringify(body));
+      uploads.push(body.url);
+      assert.ok(nombreEn(body.url).endsWith(`.${ext}`));
+      assert.ok(!/evil|exe|\.\./.test(body.url));
+    }
+  });
+
+  it('con solo clientes_editar o solo clientes_crear también puede subir', async () => {
+    for (const perm of ['clientes_editar', 'clientes_crear']) {
+      const rolId = await dbRole(`Zztest${randLetters()}`, [perm]);
+      const email = testEmail('up');
+      await dbUser({ nombre: 'Upload Prueba', email, idRol: rolId });
+      const res = await subir(await login(email));
+      const body = await res.json();
+      assert.equal(res.status, 200, JSON.stringify(body));
+      uploads.push(body.url);
+    }
+  });
+
+  it('con solo clientes_ver -> 403 y no se sube nada', async () => {
+    assert.equal((await subir(ctx.limitado)).status, 403);
+  });
+
+  it('tipos inválidos -> 400', async () => {
+    for (const type of ['text/plain', 'application/pdf', 'image/gif', 'image/svg+xml', 'application/octet-stream']) {
+      assert.equal((await subir(ctx.admin, { type, bytes: Buffer.from('x') })).status, 400, type);
+    }
+  });
+
+  it('más de 5 MB -> 413', async () => {
+    assert.equal((await subir(ctx.admin, { bytes: Buffer.alloc(5 * 1024 * 1024 + 1) })).status, 413);
+  });
+
+  it('campo con nombre incorrecto -> 400, sin archivo -> 400', async () => {
+    assert.equal((await subir(ctx.admin, { field: 'archivo' })).status, 400);
+    assert.equal((await api('POST', '/api/upload/foto', { token: ctx.admin })).status, 400);
+  });
+
+  it('la URL subida se puede usar como fotoUrl del cliente; URLs inválidas se rechazan', async () => {
+    const res = await subir(ctx.admin);
+    const { url } = await res.json();
+    uploads.push(url);
+    const c = await crearCliente({ fotoUrl: url });
+    assert.equal(c.fotoUrl, url);
+    assertErrores(await api('POST', '/api/clientes', { token: ctx.admin, body: clienteBase({ fotoUrl: 'javascript:alert(1)' }) }), ['fotoUrl']);
+    assertErrores(await api('POST', '/api/clientes', { token: ctx.admin, body: clienteBase({ fotoUrl: 'ftp://x.com/a.png' }) }), ['fotoUrl']);
+    assertErrores(await api('POST', '/api/clientes', { token: ctx.admin, body: clienteBase({ fotoUrl: 'no es url' }) }), ['fotoUrl']);
+  });
+});
+
+// ───────────────────────── Números: dashboard y facturación contra datos sembrados ─────────────────────────
+describe('dashboard: números contra datos sembrados', () => {
+  it('los contadores varían exactamente según los clientes sembrados', async () => {
+    const antes = await statsDash();
+    const h = hoy();
+    const venc = (d) => addDays(h, d);
+    // sembrados por API
+    const moroso1 = await crearCliente({ fechaInicioCuota: venc(-31), fechaVencimiento: venc(-1) });
+    const moroso2 = await crearCliente({ fechaInicioCuota: venc(-40), fechaVencimiento: venc(-10) });
+    const venceHoy = await crearCliente({ fechaInicioCuota: venc(-30), fechaVencimiento: venc(0) });
+    const limite = await crearCliente({ fechaInicioCuota: venc(POR_VENCER_DIAS - 30), fechaVencimiento: venc(POR_VENCER_DIAS) });
+    const alDia = await crearCliente({ fechaInicioCuota: venc(POR_VENCER_DIAS + 1 - 30), fechaVencimiento: venc(POR_VENCER_DIAS + 1) });
+    const suspendido = await crearCliente({ fechaInicioCuota: venc(-40), fechaVencimiento: venc(-5) });
+    const vencidoEstado = await crearCliente({ fechaVencimiento: venc(1) });
+    await api('PUT', `/api/clientes/${suspendido.id}`, { token: ctx.admin, body: { estado: 'suspendido' } });
+    await api('PUT', `/api/clientes/${vencidoEstado.id}`, { token: ctx.admin, body: { estado: 'vencido' } });
+    // sembrado por SQL, creado hace años (no es "nuevo del mes")
+    await sqlCliente({ vencimiento: venc(15), createdAt: '2020-01-15T12:00:00Z' });
+
+    const despues = await statsDash();
+    assert.equal(despues.total - antes.total, 8, 'total');
+    assert.equal(despues.activos - antes.activos, 6, 'activos (excluye suspendido y vencido)');
+    assert.equal(despues.morosos - antes.morosos, 2, 'morosos (excluye suspendido)');
+    assert.equal(despues.porVencer - antes.porVencer, 2, 'por vencer: vence hoy + límite');
+    assert.equal(despues.nuevosMes - antes.nuevosMes, 7, 'nuevos del mes (el de 2020 no cuenta)');
+    assert.ok([moroso1, moroso2, venceHoy, limite, alDia].every(Boolean));
+  });
+
+  it('en proceso: próximos vencimientos = solo morosos y por vencer activos, del más antiguo al más nuevo', inproc, async () => {
+    const h = hoy();
+    const a = await crearCliente({ fechaInicioCuota: addDays(h, -50), fechaVencimiento: addDays(h, -20) });
+    const b = await crearCliente({ fechaInicioCuota: addDays(h, -30), fechaVencimiento: h });
+    const c = await crearCliente({ fechaVencimiento: addDays(h, POR_VENCER_DIAS + 5) }); // al día: no figura
+    const d = await crearCliente({ fechaInicioCuota: addDays(h, -50), fechaVencimiento: addDays(h, -9) });
+    await api('PUT', `/api/clientes/${d.id}`, { token: ctx.admin, body: { estado: 'suspendido' } }); // suspendido: no figura
+    const lista = await clienteModel.getProximosVencimientos(100000);
+    const ids = lista.map((x) => x.id);
+    assert.ok(ids.includes(a.id) && ids.includes(b.id));
+    assert.ok(!ids.includes(c.id) && !ids.includes(d.id));
+    assert.ok(ids.indexOf(a.id) < ids.indexOf(b.id), 'orden ascendente por vencimiento');
+    assert.equal(lista.find((x) => x.id === a.id).estado_cuota, 'moroso');
+    assert.equal(lista.find((x) => x.id === b.id).estado_cuota, 'por_vencer');
+    for (let i = 1; i < lista.length; i++) assert.ok(lista[i - 1].fecha_vencimiento <= lista[i].fecha_vencimiento);
+  });
+
+  it('el endpoint limita a 10 próximos vencimientos y trae los campos esperados', async () => {
+    const s = await statsDash();
+    assert.ok(s.proximosVencimientos.length <= 10);
+    for (const p of s.proximosVencimientos) {
+      assert.deepEqual(Object.keys(p).sort(), ['estadoCuota', 'fechaVencimiento', 'id', 'nombreCompleto', 'telefono']);
+      assert.ok(['moroso', 'por_vencer'].includes(p.estadoCuota));
+    }
+  });
+
+  it('un cliente eliminado deja de contar', async () => {
+    const antes = await statsDash();
+    const c = await crearCliente();
+    assert.equal((await statsDash()).total - antes.total, 1);
+    await api('DELETE', `/api/clientes/${c.id}`, { token: ctx.admin });
+    assert.equal((await statsDash()).total, antes.total);
+  });
+});
+
+describe('facturación: stats contra pagos sembrados', () => {
+  it('hoy / semana / mes suman exactamente los pagos sembrados por fecha', async () => {
+    const c = await crearCliente();
+    const h = hoy();
+    const lunes = addDays(h, -((new Date(`${h}T00:00:00Z`).getUTCDay() + 6) % 7)); // date_trunc('week') = lunes
+    const primeroDeMes = `${h.slice(0, 8)}01`;
+    const sembrados = [
+      [h, 100.1], [addDays(h, -1), 20.2], [addDays(h, -7), 3.03], [addDays(h, -35), 4.04], [addDays(h, -400), 5.05],
+    ];
+    const antes = await statsPagos();
+    for (const [fecha, monto] of sembrados) await seedPago(c.id, fecha, monto);
+    const despues = await statsPagos();
+
+    const suma = (pred) => sembrados.filter(([f]) => pred(f)).reduce((acc, [, m]) => acc + cents(m), 0);
+    assert.equal(cents(despues.hoy - antes.hoy), suma((f) => f === h), 'hoy');
+    assert.equal(cents(despues.semana - antes.semana), suma((f) => f >= lunes), 'semana (desde el lunes)');
+    assert.equal(cents(despues.mes - antes.mes), suma((f) => f >= primeroDeMes), 'mes (desde el día 1)');
+  });
+
+  it('cobros hechos por la API se reflejan en hoy, semana y mes', async () => {
+    const c = await crearCliente();
+    const antes = await statsPagos();
+    await cobrar(ctx.admin, c.id, 150.25);
+    await cobrar(ctx.admin, c.id, 49.75, 'tarjeta');
+    const despues = await statsPagos();
+    for (const k of ['hoy', 'semana', 'mes']) assert.equal(cents(despues[k] - antes[k]), 20000, k);
+  });
+
+  it('borrar un cliente borra también sus pagos y deja de sumarlos (comportamiento actual: ON DELETE CASCADE)', async () => {
+    const c = await crearCliente();
+    await cobrar(ctx.admin, c.id, 77);
+    const antes = await statsPagos();
+    await api('DELETE', `/api/clientes/${c.id}`, { token: ctx.admin });
+    const despues = await statsPagos();
+    assert.equal(cents(antes.hoy - despues.hoy), 7700);
+  });
+});
+
+// ───────────────────────── 400 / 404 / 409 restantes por endpoint ─────────────────────────
+describe('clientes y usuarios: bordes adicionales', () => {
+  it('campos opcionales vacíos se guardan como null y los límites exactos se aceptan', async () => {
+    const c = await crearCliente({ nombre: 'Al', apellido: 'x'.repeat(50), dni: '1234567', telefono: '12345678', direccion: '', observaciones: `TEST_${'y'.repeat(494)}` });
+    assert.equal(c.direccion, null);
+    assert.equal(c.apellido.length, 50);
+    assert.equal(c.dni, '1234567');
+    const c2 = await crearCliente({ telefono: '1'.repeat(15), email: `${'a'.repeat(88)}@x.com`.slice(-100) });
+    assert.equal(c2.telefono.length, 15);
+  });
+
+  it('fecha de nacimiento: hoy ok, mañana y 1899 rechazadas', async () => {
+    assert.equal((await crearCliente({ fechaNacimiento: hoy() })).fechaNacimiento, hoy());
+    assertErrores(await api('POST', '/api/clientes', { token: ctx.admin, body: clienteBase({ fechaNacimiento: addDays(hoy(), 1) }) }), ['fechaNacimiento']);
+    assertErrores(await api('POST', '/api/clientes', { token: ctx.admin, body: clienteBase({ fechaNacimiento: '1899-12-31' }) }), ['fechaNacimiento']);
+    assertErrores(await api('POST', '/api/clientes', { token: ctx.admin, body: clienteBase({ fechaNacimiento: '2024-02-30' }) }), ['fechaNacimiento']);
+  });
+
+  it('tipos incorrectos en el cuerpo -> 400 y nunca 500', async () => {
+    const malos = [{ nombre: 123 }, { nombre: ['a'] }, { dni: {} }, { email: 5 }, { telefono: [] }, { observaciones: 5 }, { fotoUrl: 5 }];
+    for (const m of malos) {
+      const r = await api('POST', '/api/clientes', { token: ctx.admin, body: clienteBase(m) });
+      assert.equal(r.status, 400, JSON.stringify(m));
+    }
+    assert.equal((await api('POST', '/api/clientes', { token: ctx.admin, body: [] })).status, 400);
+    assert.equal((await api('POST', '/api/pagos', { token: ctx.admin, body: 'texto' })).status, 400);
+  });
+
+  it('PUT con el mismo DNI propio no es conflicto; dni nuevo libre se aplica', async () => {
+    const c = await crearCliente();
+    assert.equal((await api('PUT', `/api/clientes/${c.id}`, { token: ctx.admin, body: { dni: c.dni } })).status, 200);
+    const nuevo = randDni();
+    const r = await api('PUT', `/api/clientes/${c.id}`, { token: ctx.admin, body: { dni: nuevo } });
+    assert.equal(r.body.data.dni, nuevo);
+  });
+
+  it('usuarios: validaciones de borde en alta (contraseña 8/72, nombre, email 100)', async () => {
+    const base = (o) => ({ nombre: 'Borde Prueba', email: testEmail('b'), password: PASSWORD, idRol: ctx.limitadoRolId, ...o });
+    const post = (o) => api('POST', '/api/usuarios', { token: ctx.admin, body: base(o) });
+    assertErrores(await post({ password: 'abcde12' }), ['password']); // 7
+    assertErrores(await post({ password: `a1${'x'.repeat(71)}` }), ['password']); // 73
+    assertErrores(await post({ nombre: 'Ana3' }), ['nombre']);
+    assertErrores(await post({ email: `${'a'.repeat(95)}@x.com` }), ['email']);
+    assertErrores(await post({ idRol: null }), ['idRol']);
+    for (const password of ['abcdefg1', `a1${'x'.repeat(70)}`]) {
+      const r = await post({ password });
+      assert.equal(r.status, 201, r.text);
+      ctx.ids.usuarios.push(r.body.data.id);
+    }
+  });
+
+  it('usuarios: nunca se expone password_hash', async () => {
+    const lista = (await api('GET', '/api/usuarios', { token: ctx.admin })).text;
+    assert.ok(!/password/i.test(lista));
+  });
+});
