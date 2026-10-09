@@ -100,14 +100,10 @@ async function anular({ id, usuario_id, motivo }) {
         [restantes[0].periodo_desde, restantes[0].periodo_hasta, clienteId]
       );
     } else {
-      // Sin pagos vigentes: la cuota vuelve al estado que tenía un cliente recién creado, tomando
-      // el día en que se cargó (created_at, en la zona del gimnasio). No se usa fecha_alta porque
-      // puede ser retroactiva o editarse: con un alta de hace meses quedaría moroso de golpe.
+      // Sin pagos vigentes: la cuota vuelve al estado que tiene un cliente recién creado, que
+      // arranca en su fecha de alta (ver clienteController.create).
       await client.query(
-        `UPDATE clientes SET
-           fecha_inicio_cuota = (created_at AT TIME ZONE '${TZ}')::date,
-           fecha_vencimiento = (created_at AT TIME ZONE '${TZ}')::date + $2::int,
-           updated_at = now()
+        `UPDATE clientes SET fecha_inicio_cuota = fecha_alta, fecha_vencimiento = fecha_alta + $2::int, updated_at = now()
          WHERE id = $1`,
         [clienteId, PERIODO_DIAS]
       );

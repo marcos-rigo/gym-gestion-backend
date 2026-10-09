@@ -59,9 +59,11 @@ async function getById(req, res) {
 async function create(req, res) {
   try {
     const { values: v, errors } = V.validate(req.body, schema);
-    const fechaInicio = v.fechaInicioCuota || hoyISO();
+    // Sin inicio de cuota explícito, la cuota arranca en la fecha de alta (que puede ser retroactiva).
+    const fechaAlta = v.fechaAlta || hoyISO();
+    const fechaInicio = v.fechaInicioCuota || fechaAlta;
     const fechaVenc = v.fechaVencimiento || addDays(fechaInicio, PERIODO_DIAS);
-    if (!errors.fechaInicioCuota && !errors.fechaVencimiento && fechaVenc < fechaInicio) {
+    if (!errors.fechaAlta && !errors.fechaInicioCuota && !errors.fechaVencimiento && fechaVenc < fechaInicio) {
       errors.fechaVencimiento = MSG_VENC;
     }
     if (Object.keys(errors).length > 0) return V.sendValidationError(res, errors);
@@ -79,7 +81,7 @@ async function create(req, res) {
       foto_url: v.fotoUrl,
       contacto_emergencia: v.contactoEmergencia,
       observaciones: v.observaciones,
-      fecha_alta: v.fechaAlta || hoyISO(),
+      fecha_alta: fechaAlta,
       fecha_inicio_cuota: fechaInicio,
       fecha_vencimiento: fechaVenc,
     });
