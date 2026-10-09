@@ -28,6 +28,8 @@ const schema = {
   fotoUrl: V.url('La foto'),
   contactoEmergencia: V.texto('El contacto de emergencia', { max: 100 }),
   observaciones: V.texto('Las observaciones', { max: 500 }),
+  // Puede ser retroactiva (clientes que ya venían antes de cargarse en el sistema), nunca futura.
+  fechaAlta: V.fechaNoFutura('La fecha de alta'),
   fechaInicioCuota: V.fecha('La fecha de inicio de cuota'),
   fechaVencimiento: V.fecha('La fecha de vencimiento'),
 };
@@ -77,6 +79,7 @@ async function create(req, res) {
       foto_url: v.fotoUrl,
       contacto_emergencia: v.contactoEmergencia,
       observaciones: v.observaciones,
+      fecha_alta: v.fechaAlta || hoyISO(),
       fecha_inicio_cuota: fechaInicio,
       fecha_vencimiento: fechaVenc,
     });
@@ -96,7 +99,8 @@ async function update(req, res) {
     // Los campos no enviados conservan su valor actual; null/'' en un campo opcional lo vacía.
     const { values: v, errors } = V.validate(req.body, updateSchema, { partial: true });
     const pick = (key, col) => (v[key] !== undefined ? v[key] : existing[col]);
-    // Las fechas de cuota son NOT NULL: si llegan vacías se conserva la actual.
+    // Las fechas de alta y de cuota son NOT NULL: si llegan vacías se conserva la actual.
+    const fechaAlta = v.fechaAlta ?? existing.fecha_alta;
     const fechaInicio = v.fechaInicioCuota ?? existing.fecha_inicio_cuota;
     const fechaVenc = v.fechaVencimiento ?? existing.fecha_vencimiento;
     if (!errors.fechaInicioCuota && !errors.fechaVencimiento && fechaVenc < fechaInicio) {
@@ -120,6 +124,7 @@ async function update(req, res) {
       foto_url: pick('fotoUrl', 'foto_url'),
       contacto_emergencia: pick('contactoEmergencia', 'contacto_emergencia'),
       observaciones: pick('observaciones', 'observaciones'),
+      fecha_alta: fechaAlta,
       fecha_inicio_cuota: fechaInicio,
       fecha_vencimiento: fechaVenc,
       estado: v.estado ?? existing.estado,

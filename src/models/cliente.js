@@ -37,34 +37,34 @@ async function findByDNI(dni) {
 
 async function create({
   nombre, apellido, dni, fecha_nacimiento, telefono, email, direccion,
-  foto_url, contacto_emergencia, observaciones, fecha_inicio_cuota, fecha_vencimiento,
+  foto_url, contacto_emergencia, observaciones, fecha_alta, fecha_inicio_cuota, fecha_vencimiento,
 }) {
   const { rows } = await pool.query(
     `INSERT INTO clientes
       (nombre, apellido, dni, fecha_nacimiento, telefono, email, direccion,
-       foto_url, contacto_emergencia, observaciones, fecha_inicio_cuota, fecha_vencimiento)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       foto_url, contacto_emergencia, observaciones, fecha_alta, fecha_inicio_cuota, fecha_vencimiento)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
      RETURNING id`,
     [nombre, apellido, dni, fecha_nacimiento ?? null, telefono ?? null, email ?? null,
      direccion ?? null, foto_url ?? null, contacto_emergencia ?? null, observaciones ?? null,
-     fecha_inicio_cuota, fecha_vencimiento]
+     fecha_alta, fecha_inicio_cuota, fecha_vencimiento]
   );
   return findById(rows[0].id);
 }
 
 async function update(id, {
   nombre, apellido, dni, fecha_nacimiento, telefono, email, direccion,
-  foto_url, contacto_emergencia, observaciones, fecha_inicio_cuota, fecha_vencimiento, estado,
+  foto_url, contacto_emergencia, observaciones, fecha_alta, fecha_inicio_cuota, fecha_vencimiento, estado,
 }) {
   await pool.query(
     `UPDATE clientes SET
        nombre=$1, apellido=$2, dni=$3, fecha_nacimiento=$4, telefono=$5, email=$6,
        direccion=$7, foto_url=$8, contacto_emergencia=$9, observaciones=$10,
-       fecha_inicio_cuota=$11, fecha_vencimiento=$12, estado=$13, updated_at=now()
-     WHERE id=$14`,
+       fecha_alta=$11, fecha_inicio_cuota=$12, fecha_vencimiento=$13, estado=$14, updated_at=now()
+     WHERE id=$15`,
     [nombre, apellido, dni, fecha_nacimiento ?? null, telefono ?? null, email ?? null,
      direccion ?? null, foto_url ?? null, contacto_emergencia ?? null, observaciones ?? null,
-     fecha_inicio_cuota, fecha_vencimiento, estado, id]
+     fecha_alta, fecha_inicio_cuota, fecha_vencimiento, estado, id]
   );
   return findById(id);
 }
@@ -81,7 +81,8 @@ async function getStats() {
       COUNT(*) FILTER (WHERE estado = 'activo')::int AS activos,
       COUNT(*) FILTER (WHERE ${ESTADO_CUOTA_SQL} = 'moroso')::int AS morosos,
       COUNT(*) FILTER (WHERE ${ESTADO_CUOTA_SQL} = 'por_vencer')::int AS por_vencer,
-      COUNT(*) FILTER (WHERE date_trunc('month', created_at AT TIME ZONE '${TZ}') = date_trunc('month', ${HOY_SQL}))::int AS nuevos_mes
+      -- Por fecha_alta (no created_at): un cliente cargado hoy con alta retroactiva no es "nuevo".
+      COUNT(*) FILTER (WHERE date_trunc('month', fecha_alta) = date_trunc('month', ${HOY_SQL}))::int AS nuevos_mes
     FROM clientes
   `);
   return rows[0];

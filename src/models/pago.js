@@ -69,11 +69,10 @@ async function anular({ id, usuario_id, motivo }) {
     const clienteId = pagoRows[0].cliente_id;
 
     const { rows: clienteRows } = await client.query(
-      'SELECT fecha_alta FROM clientes WHERE id = $1 FOR UPDATE',
+      'SELECT id FROM clientes WHERE id = $1 FOR UPDATE',
       [clienteId]
     );
     if (!clienteRows[0]) throw new Error('CLIENTE_NO_ENCONTRADO');
-    const fechaAlta = clienteRows[0].fecha_alta;
 
     const { rows: ultimoRows } = await client.query(
       `SELECT id FROM pagos WHERE cliente_id = $1 AND anulado = false
@@ -101,10 +100,14 @@ async function anular({ id, usuario_id, motivo }) {
         [restantes[0].periodo_desde, restantes[0].periodo_hasta, clienteId]
       );
     } else {
-      // Sin pagos vigentes: la cuota vuelve al estado que tenía un cliente recién creado
-      // (fecha_alta no se toca nunca por un cobro, así que es el único rastro que queda).
+      // Sin pagos vigentes: la cuota vuelve al estado que tenía un cliente recién creado, tomando
+      // el día en que se cargó (created_at, en la zona del gimnasio). No se usa fecha_alta porque
+      // puede ser retroactiva o editarse: con un alta de hace meses quedaría moroso de golpe.
       await client.query(
-        `UPDATE clientes SET fecha_inicio_cuota = fecha_alta, fecha_vencimiento = fecha_alta + $2::int, updated_at = now()
+        `UPDATE clientes SET
+           fecha_inicio_cuota = (created_at AT TIME ZONE '${TZ}')::date,
+           fecha_vencimiento = (created_at AT TIME ZONE '${TZ}')::date + $2::int,
+           updated_at = now()
          WHERE id = $1`,
         [clienteId, PERIODO_DIAS]
       );

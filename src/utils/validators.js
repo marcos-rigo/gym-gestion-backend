@@ -101,6 +101,15 @@ const fecha = (label, opts) => rule((raw) => {
   return v ? { value: v } : { error: `${label} no es una fecha válida (formato AAAA-MM-DD)` };
 }, opts);
 
+// Fecha válida que no puede ser posterior a hoy (zona del gimnasio), p. ej. fecha de alta retroactiva.
+const fechaNoFutura = (label, opts) => rule((raw) => {
+  const v = parseFecha(raw);
+  if (!v) return { error: `${label} no es una fecha válida (formato AAAA-MM-DD)` };
+  if (v > hoyISO()) return { error: `${label} no puede ser futura` };
+  if (v < '1900-01-01') return { error: `${label} no es válida` };
+  return { value: v };
+}, opts);
+
 // Fecha de nacimiento: válida, desde 1900 y no futura.
 const fechaNacimiento = (opts) => rule((raw) => {
   const v = parseFecha(raw);
@@ -196,6 +205,6 @@ function uuidParam(req, res, next, value, name) {
 }
 
 module.exports = {
-  nombre, dni, telefono, email, password, monto, fecha, fechaNacimiento, uuid, enumOf, texto, url,
+  nombre, dni, telefono, email, password, monto, fecha, fechaNoFutura, fechaNacimiento, uuid, enumOf, texto, url,
   listaStrings, nombreProducto, entero, validate, sendValidationError, sendConflict, uuidParam,
 };

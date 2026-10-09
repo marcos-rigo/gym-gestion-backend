@@ -16,6 +16,7 @@ const pagosRoutes = require('./src/routes/pagos');
 const productosRoutes = require('./src/routes/productos');
 const ventasRoutes = require('./src/routes/ventas');
 const cajaRoutes = require('./src/routes/caja');
+const reportesRoutes = require('./src/routes/reportes');
 
 const app = express();
 app.disable('x-powered-by');
@@ -33,6 +34,7 @@ app.use('/api/pagos', pagosRoutes);
 app.use('/api/productos', productosRoutes);
 app.use('/api/ventas', ventasRoutes);
 app.use('/api/caja', cajaRoutes);
+app.use('/api/reportes', reportesRoutes);
 
 app.use((req, res) => res.status(404).json({ message: 'Ruta no encontrada' }));
 
