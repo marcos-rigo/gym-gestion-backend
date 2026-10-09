@@ -110,6 +110,25 @@ const fechaNacimiento = (opts) => rule((raw) => {
   return { value: v };
 }, opts);
 
+// Nombre de producto: letras, dígitos y espacios (sin guion/apóstrofe). 2-60.
+const NOMBRE_PRODUCTO_RE = /^[\p{L}\p{N}]+(?: [\p{L}\p{N}]+)*$/u;
+const nombreProducto = (label, opts) => rule((raw) => {
+  if (typeof raw !== 'string') return { error: `${label} debe ser texto` };
+  const v = raw.trim().replace(/\s+/g, ' ');
+  if (v.length < 2 || v.length > 60) return { error: `${label} debe tener entre 2 y 60 caracteres` };
+  if (!NOMBRE_PRODUCTO_RE.test(v)) return { error: `${label} solo puede contener letras, números y espacios` };
+  return { value: v };
+}, opts);
+
+// Entero dentro de un rango opcional (stock, cantidades, deltas de ajuste).
+const entero = (label, { min, max, ...opts } = {}) => rule((raw) => {
+  const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw.trim()) : NaN;
+  if (!Number.isInteger(n)) return { error: `${label} debe ser un número entero` };
+  if (min !== undefined && n < min) return { error: `${label} debe ser mayor o igual a ${min}` };
+  if (max !== undefined && n > max) return { error: `${label} debe ser menor o igual a ${max}` };
+  return { value: n };
+}, opts);
+
 // UUID (los ids de este sistema son uuid, no enteros).
 const uuid = (label, opts) => rule((raw) => (
   typeof raw === 'string' && UUID_RE.test(raw) ? { value: raw.toLowerCase() } : { error: `${label} no es válido` }
@@ -178,5 +197,5 @@ function uuidParam(req, res, next, value, name) {
 
 module.exports = {
   nombre, dni, telefono, email, password, monto, fecha, fechaNacimiento, uuid, enumOf, texto, url,
-  listaStrings, validate, sendValidationError, sendConflict, uuidParam,
+  listaStrings, nombreProducto, entero, validate, sendValidationError, sendConflict, uuidParam,
 };

@@ -1,4 +1,5 @@
 const cliente = require('../models/cliente');
+const venta = require('../models/venta');
 
 function toCamelCase(obj) {
   if (!obj) return null;
@@ -16,6 +17,7 @@ async function getStats(req, res) {
   try {
     const stats = await cliente.getStats();
     const proximosVencimientos = await cliente.getProximosVencimientos();
+    const ventasHoy = await venta.getTotalHoy();
     return res.json({
       data: {
         total: Number(stats.total),
@@ -24,6 +26,8 @@ async function getStats(req, res) {
         porVencer: Number(stats.por_vencer),
         nuevosMes: Number(stats.nuevos_mes),
         proximosVencimientos: toCamelCase(proximosVencimientos),
+        ventasHoyTotal: ventasHoy.total,
+        ventasHoyCantidad: ventasHoy.cantidad,
       }
     });
   } catch (err) {

@@ -17,16 +17,35 @@ function toCamelCase(obj) {
 
 // El período (desde/hasta) lo calcula el servidor a partir del vencimiento del cliente,
 // por eso el vencimiento resultante nunca puede quedar antes de la fecha de pago.
+//
+// `metodo` es requerido salvo que venga `pagos` (desglose dividido): eso se valida aparte
+// porque "requerido a menos que..." no entra en el sistema de reglas planas de V.validate.
+const METODOS_PAGO = ['efectivo', 'transferencia'];
 const schema = {
   clienteId: V.uuid('El cliente', { required: true }),
   monto: V.monto({ required: true }),
-  metodo: V.enumOf('El método de pago', ['efectivo', 'tarjeta', 'transferencia'], { required: true }),
+  metodo: V.enumOf('El método de pago', METODOS_PAGO),
 };
+
+function validarDesglose(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) return { error: 'Debe incluir al menos un método de pago' };
+  for (const p of raw) {
+    if (!p || typeof p !== 'object') return { error: 'Cada pago debe ser un objeto' };
+    if (!METODOS_PAGO.includes(p.metodo)) {
+      return { error: `El método de cada pago debe ser uno de: ${METODOS_PAGO.join(', ')}` };
+    }
+    const s = typeof p.monto === 'number' ? String(p.monto) : typeof p.monto === 'string' ? p.monto.trim() : null;
+    if (s === null || !/^\d+(\.\d{1,2})?$/.test(s) || Number(s) <= 0) {
+      return { error: 'El monto de cada pago debe ser un número positivo con hasta 2 decimales' };
+    }
+  }
+  return { value: raw.map((p) => ({ metodo: p.metodo, monto: Number(p.monto) })) };
+}
 
 const findAllSchema = {
   desde: V.fecha('Desde'),
   hasta: V.fecha('Hasta'),
-  metodo: V.enumOf('El método de pago', ['efectivo', 'tarjeta', 'transferencia']),
+  metodo: V.enumOf('El método de pago', METODOS_PAGO),
   usuarioId: V.uuid('El empleado'),
   estado: V.enumOf('El estado', ['vigente', 'anulado']),
   clienteQuery: V.texto('La búsqueda', { max: 100 }),
@@ -38,10 +57,27 @@ const anularSchema = {
 
 async function create(req, res) {
   try {
-    const { ok, values: v, errors } = V.validate(req.body, schema);
-    if (!ok) return V.sendValidationError(res, errors);
+    const { values: v, errors } = V.validate(req.body, schema, { partial: true });
+    if (req.body?.clienteId === undefined) errors.clienteId = 'Este campo es requerido';
+    if (req.body?.monto === undefined) errors.monto = 'Este campo es requerido';
 
-    const item = await pago.create({ cliente_id: v.clienteId, usuario_id: req.user.id, monto: v.monto, metodo: v.metodo });
+    let desglose;
+    if (req.body?.pagos !== undefined) {
+      const r = validarDesglose(req.body.pagos);
+      if (r.error) errors.pagos = r.error;
+      else desglose = r.value;
+    } else if (req.body?.metodo === undefined) {
+      errors.metodo = 'Este campo es requerido';
+    }
+    if (!errors.pagos && desglose && !errors.monto && v.monto !== undefined) {
+      const suma = Math.round(desglose.reduce((acc, p) => acc + p.monto, 0) * 100) / 100;
+      if (suma !== v.monto) errors.pagos = 'La suma de los pagos debe ser igual al monto';
+    }
+    if (Object.keys(errors).length > 0) return V.sendValidationError(res, errors);
+
+    const item = await pago.create({
+      cliente_id: v.clienteId, usuario_id: req.user.id, monto: v.monto, metodo: v.metodo, desglose,
+    });
     return res.status(201).json({ data: toCamelCase(item) });
   } catch (err) {
     if (err.message === 'CLIENTE_NO_ENCONTRADO') {

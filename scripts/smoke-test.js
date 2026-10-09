@@ -32,7 +32,7 @@ const { corsOrigins } = require('../src/config/env');
 
 let server;
 let baseUrl = process.env.TEST_BASE_URL;
-const ctx = { ids: { clientes: [], usuarios: [], roles: [] } };
+const ctx = { ids: { clientes: [], usuarios: [], roles: [], productos: [] } };
 
 async function api(method, path, { token, body, headers = {}, raw } = {}) {
   const h = { ...headers };
@@ -87,6 +87,17 @@ async function crearCliente(over = {}) {
   return r.body.data;
 }
 
+const productoBase = (over = {}) => ({
+  nombre: `Zztest${randLetters(10)}`, precio: 100, ...over,
+});
+
+async function crearProducto(over = {}) {
+  const r = await api('POST', '/api/productos', { token: ctx.admin, body: productoBase(over) });
+  assert.equal(r.status, 201, r.text);
+  ctx.ids.productos.push(r.body.data.id);
+  return r.body.data;
+}
+
 function assertErrores(r, campos) {
   assert.equal(r.status, 400, r.text);
   assert.ok(r.body.message, 'falta message');
@@ -96,6 +107,20 @@ function assertErrores(r, campos) {
 async function cleanup() {
   const emailLike = 'test\\_%@example.test';
   const q = (sql, params) => pool.query(sql, params).catch((e) => console.error('cleanup:', e.message));
+  const usuariosTestSql = `(SELECT id FROM usuarios WHERE email LIKE $1)`;
+
+  // Productos/ventas/caja: tablas nuevas de Facturación Fase 3+. movimientos_stock no tiene
+  // ON DELETE CASCADE hacia ventas/productos (a propósito: en uso normal nunca se borran), así
+  // que hay que vaciarlo antes de poder borrar esas filas.
+  await q(`DELETE FROM movimientos_stock WHERE id_usuario IN ${usuariosTestSql}
+             OR id_producto IN (SELECT id FROM productos WHERE nombre LIKE 'Zztest%' OR id = ANY($2::uuid[]))
+             OR id_venta IN (SELECT id FROM ventas WHERE id_usuario IN ${usuariosTestSql})`,
+    [emailLike, ctx.ids.productos]);
+  await q(`DELETE FROM ventas WHERE id_usuario IN ${usuariosTestSql}`, [emailLike]); // cascada a venta_items/venta_pagos
+  await q(`DELETE FROM productos WHERE nombre LIKE 'Zztest%' OR id = ANY($1::uuid[])`, [ctx.ids.productos]);
+  await q(`DELETE FROM movimientos_caja WHERE id_usuario IN ${usuariosTestSql}`, [emailLike]);
+  await q(`DELETE FROM caja_apertura WHERE id_usuario IN ${usuariosTestSql}`, [emailLike]);
+
   await q(`DELETE FROM pagos WHERE usuario_id IN (SELECT id FROM usuarios WHERE email LIKE $1)
              OR cliente_id IN (SELECT id FROM clientes WHERE email LIKE $1 OR observaciones LIKE 'TEST\\_%')`, [emailLike]);
   await q(`DELETE FROM clientes WHERE email LIKE $1 OR observaciones LIKE 'TEST\\_%' OR id = ANY($2::uuid[])`, [emailLike, ctx.ids.clientes]);
@@ -379,7 +404,7 @@ describe('pagos y cobros', () => {
   it('cliente moroso: el período arranca hoy y dura 30 días', async () => {
     const hoy = hoyISO();
     const c = await crearCliente({ fechaInicioCuota: addDays(hoy, -40), fechaVencimiento: addDays(hoy, -5) });
-    const r = await api('POST', '/api/pagos', { token: ctx.admin, body: { clienteId: c.id, monto: 1500.5, metodo: 'tarjeta' } });
+    const r = await api('POST', '/api/pagos', { token: ctx.admin, body: { clienteId: c.id, monto: 1500.5, metodo: 'transferencia' } });
     assert.equal(r.status, 201, r.text);
     assert.equal(Number(r.body.data.monto), 1500.5);
     assert.equal(r.body.data.usuarioId, ctx.adminId);
@@ -634,4 +659,7 @@ describe('upload de fotos', () => {
 });
 
 // Helpers compartidos con scripts/extended-test.js (que importa este archivo y suma más describes).
-module.exports = { api, login, dbUser, dbRole, crearCliente, assertErrores, ctx, rand, randLetters, randDni, testEmail, clienteBase, PASSWORD, external, protectedEmail, getBaseUrl: () => baseUrl };
+module.exports = {
+  api, login, dbUser, dbRole, crearCliente, crearProducto, assertErrores, ctx, rand, randLetters, randDni,
+  testEmail, clienteBase, productoBase, PASSWORD, external, protectedEmail, getBaseUrl: () => baseUrl,
+};

@@ -1,10 +1,26 @@
 const { pool, withTransaction } = require('../config/db');
 const { TZ, HOY_SQL, PERIODO_DIAS } = require('../config/fechas');
 
+// Resuelve el `metodo` resumen de pagos.metodo ('efectivo' | 'transferencia' | 'mixto') y las
+// filas de pago_metodos a insertar, a partir de `metodo` legacy o de un desglose explícito.
+// Siempre devuelve al menos una fila: toda cuota debe terminar con desglose en pago_metodos.
+function resolverDesglose({ metodo, monto, desglose }) {
+  if (!desglose) return { metodoResumen: metodo, filas: [{ metodo, monto }] };
+  const metodosUsados = [...new Set(desglose.map((d) => d.metodo))];
+  return {
+    metodoResumen: metodosUsados.length > 1 ? 'mixto' : metodosUsados[0],
+    filas: desglose,
+  };
+}
+
 // Registra el pago y renueva la cuota del cliente de forma atómica.
 // El período arranca en el vencimiento actual (si aún no venció) o en hoy, calculado en SQL
 // para usar la fecha de la zona horaria del gimnasio y no la del proceso Node.
-async function create({ cliente_id, usuario_id, monto, metodo }) {
+// `desglose` (opcional) es un array [{ metodo, monto }] cuya suma debe ser igual a `monto`;
+// si no se manda, se usa el `metodo` único (comportamiento de siempre, compatible con el front viejo).
+async function create({ cliente_id, usuario_id, monto, metodo, desglose }) {
+  const { metodoResumen, filas } = resolverDesglose({ metodo, monto, desglose });
+
   const pagoId = await withTransaction(async (client) => {
     const { rows: clienteRows } = await client.query(
       `SELECT GREATEST(fecha_vencimiento, ${HOY_SQL}) AS desde FROM clientes WHERE id = $1 FOR UPDATE`,
@@ -16,15 +32,23 @@ async function create({ cliente_id, usuario_id, monto, metodo }) {
     const { rows } = await client.query(
       `INSERT INTO pagos (cliente_id, usuario_id, monto, metodo, periodo_desde, periodo_hasta)
        VALUES ($1,$2,$3,$4,$5::date,$5::date + $6::int) RETURNING id, periodo_hasta`,
-      [cliente_id, usuario_id, monto, metodo, desde, PERIODO_DIAS]
+      [cliente_id, usuario_id, monto, metodoResumen, desde, PERIODO_DIAS]
     );
+    const pagoId = rows[0].id;
+
+    for (const f of filas) {
+      await client.query(
+        'INSERT INTO pago_metodos (id_pago, metodo, monto) VALUES ($1,$2,$3)',
+        [pagoId, f.metodo, f.monto]
+      );
+    }
 
     await client.query(
       `UPDATE clientes SET fecha_vencimiento = $1, fecha_inicio_cuota = $2, estado = 'activo', updated_at = now()
        WHERE id = $3`,
       [rows[0].periodo_hasta, desde, cliente_id]
     );
-    return rows[0].id;
+    return pagoId;
   });
   return findById(pagoId);
 }
@@ -88,14 +112,25 @@ async function anular({ id, usuario_id, motivo }) {
   });
 }
 
+// Subconsulta reutilizada por findById/findAll/findByCliente: el desglose por método
+// vive siempre en pago_metodos (incluso para pagos de un solo método, por el backfill),
+// así que es la única fuente de verdad para quien necesite el detalle.
+const METODOS_SQL = `COALESCE((
+  SELECT json_agg(json_build_object('metodo', pm.metodo, 'monto', pm.monto) ORDER BY pm.id)
+  FROM pago_metodos pm WHERE pm.id_pago = pagos.id
+), '[]')`;
+
 async function findById(id) {
-  const { rows } = await pool.query('SELECT * FROM pagos WHERE id = $1', [id]);
+  const { rows } = await pool.query(
+    `SELECT pagos.*, ${METODOS_SQL} AS metodos FROM pagos WHERE id = $1`, [id]
+  );
   return rows[0] ?? null;
 }
 
 async function findByCliente(cliente_id) {
   const { rows } = await pool.query(
-    'SELECT * FROM pagos WHERE cliente_id = $1 ORDER BY fecha_pago DESC', [cliente_id]
+    `SELECT pagos.*, ${METODOS_SQL} AS metodos FROM pagos WHERE cliente_id = $1 ORDER BY fecha_pago DESC`,
+    [cliente_id]
   );
   return rows;
 }
@@ -128,7 +163,11 @@ async function findAll({ limit = 50, offset = 0, ...filtros } = {}) {
   const { rows } = await pool.query(`
     SELECT p.*,
       c.nombre AS cliente_nombre, c.apellido AS cliente_apellido, c.dni AS cliente_dni,
-      u.nombre AS usuario_nombre, a.nombre AS anulado_por_nombre
+      u.nombre AS usuario_nombre, a.nombre AS anulado_por_nombre,
+      COALESCE((
+        SELECT json_agg(json_build_object('metodo', pm.metodo, 'monto', pm.monto) ORDER BY pm.id)
+        FROM pago_metodos pm WHERE pm.id_pago = p.id
+      ), '[]') AS metodos
     FROM pagos p
     JOIN clientes c ON c.id = p.cliente_id
     LEFT JOIN usuarios u ON u.id = p.usuario_id
@@ -193,6 +232,11 @@ async function getStatsFacturacion() {
 // Cierre de caja de un día: totales generales, por método y por empleado (con su propio
 // desglose por método), más las anulaciones del día aparte como dato informativo.
 // `usuarioId` restringe todo al turno de ese empleado (lo decide el controller según permisos).
+//
+// El desglose por método SIEMPRE se lee de pago_metodos (no de pagos.metodo, que puede ser
+// 'mixto'): así un cobro dividido entre efectivo y transferencia aporta a ambos buckets por
+// el monto real de cada uno. Los totales generales/por-empleado, en cambio, se calculan sobre
+// `pagos` directamente para no contar dos veces un mismo cobro dividido.
 async function getCierreCaja({ fecha, usuarioId } = {}) {
   const params = [fecha];
   let filtroUsuario = '';
@@ -201,53 +245,65 @@ async function getCierreCaja({ fecha, usuarioId } = {}) {
     filtroUsuario = ` AND p.usuario_id = $2`;
   }
 
-  const { rows } = await pool.query(`
-    SELECT p.usuario_id, u.nombre AS usuario_nombre, p.metodo, p.anulado,
-      COUNT(*)::int AS cantidad, COALESCE(SUM(p.monto), 0) AS monto
-    FROM pagos p
-    LEFT JOIN usuarios u ON u.id = p.usuario_id
-    WHERE (p.fecha_pago AT TIME ZONE '${TZ}')::date = $1::date${filtroUsuario}
-    GROUP BY p.usuario_id, u.nombre, p.metodo, p.anulado
-  `, params);
+  const [{ rows: totales }, { rows: porMetodoRows }] = await Promise.all([
+    pool.query(`
+      SELECT p.usuario_id, u.nombre AS usuario_nombre, p.anulado,
+        COUNT(*)::int AS cantidad, COALESCE(SUM(p.monto), 0) AS monto
+      FROM pagos p
+      LEFT JOIN usuarios u ON u.id = p.usuario_id
+      WHERE (p.fecha_pago AT TIME ZONE '${TZ}')::date = $1::date${filtroUsuario}
+      GROUP BY p.usuario_id, u.nombre, p.anulado
+    `, params),
+    pool.query(`
+      SELECT p.usuario_id, pm.metodo, p.anulado,
+        COUNT(DISTINCT p.id)::int AS cantidad, COALESCE(SUM(pm.monto), 0) AS monto
+      FROM pagos p
+      JOIN pago_metodos pm ON pm.id_pago = p.id
+      WHERE (p.fecha_pago AT TIME ZONE '${TZ}')::date = $1::date${filtroUsuario}
+      GROUP BY p.usuario_id, pm.metodo, p.anulado
+    `, params),
+  ]);
 
-  const vigentes = rows.filter((r) => !r.anulado);
-  const anuladas = rows.filter((r) => r.anulado);
+  const totalesVigentes = totales.filter((r) => !r.anulado);
+  const totalesAnulados = totales.filter((r) => r.anulado);
+  const porMetodoVigentes = porMetodoRows.filter((r) => !r.anulado);
 
   const porMetodoMap = new Map();
+  for (const r of porMetodoVigentes) {
+    const acc = porMetodoMap.get(r.metodo) ?? { metodo: r.metodo, monto: 0, cantidad: 0 };
+    acc.monto += Number(r.monto);
+    acc.cantidad += r.cantidad;
+    porMetodoMap.set(r.metodo, acc);
+  }
+
   const porEmpleadoMap = new Map();
-  for (const r of vigentes) {
-    const monto = Number(r.monto);
-
-    const metodoAcc = porMetodoMap.get(r.metodo) ?? { metodo: r.metodo, monto: 0, cantidad: 0 };
-    metodoAcc.monto += monto;
-    metodoAcc.cantidad += r.cantidad;
-    porMetodoMap.set(r.metodo, metodoAcc);
-
+  for (const r of totalesVigentes) {
     const empKey = r.usuario_id ?? 'sin-empleado';
-    const empAcc = porEmpleadoMap.get(empKey) ?? {
+    porEmpleadoMap.set(empKey, {
       usuarioId: r.usuario_id,
       usuarioNombre: r.usuario_nombre ?? 'Sin empleado asignado',
-      monto: 0,
-      cantidad: 0,
+      monto: Number(r.monto),
+      cantidad: r.cantidad,
       porMetodo: [],
-    };
-    empAcc.monto += monto;
-    empAcc.cantidad += r.cantidad;
-    empAcc.porMetodo.push({ metodo: r.metodo, monto, cantidad: r.cantidad });
-    porEmpleadoMap.set(empKey, empAcc);
+    });
+  }
+  for (const r of porMetodoVigentes) {
+    const empKey = r.usuario_id ?? 'sin-empleado';
+    const emp = porEmpleadoMap.get(empKey);
+    if (emp) emp.porMetodo.push({ metodo: r.metodo, monto: Number(r.monto), cantidad: r.cantidad });
   }
 
   return {
     fecha,
     general: {
-      monto: vigentes.reduce((acc, r) => acc + Number(r.monto), 0),
-      cantidad: vigentes.reduce((acc, r) => acc + r.cantidad, 0),
+      monto: totalesVigentes.reduce((acc, r) => acc + Number(r.monto), 0),
+      cantidad: totalesVigentes.reduce((acc, r) => acc + r.cantidad, 0),
     },
     porMetodo: [...porMetodoMap.values()],
     porEmpleado: [...porEmpleadoMap.values()],
     anulados: {
-      cantidad: anuladas.reduce((acc, r) => acc + r.cantidad, 0),
-      monto: anuladas.reduce((acc, r) => acc + Number(r.monto), 0),
+      cantidad: totalesAnulados.reduce((acc, r) => acc + r.cantidad, 0),
+      monto: totalesAnulados.reduce((acc, r) => acc + Number(r.monto), 0),
     },
   };
 }

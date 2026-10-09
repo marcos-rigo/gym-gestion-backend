@@ -7,6 +7,8 @@
 const { describe, it, before } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -17,6 +19,8 @@ const { pool } = require('../src/config/db');
 const { hoyISO, addDays, POR_VENCER_DIAS, PERIODO_DIAS, TZ } = require('../src/config/fechas');
 const usuarioModel = require('../src/models/usuario');
 const clienteModel = require('../src/models/cliente');
+const movimientoCaja = require('../src/models/movimientoCaja');
+const cajaApertura = require('../src/models/cajaApertura');
 
 const inproc = { skip: external && 'requiere app en proceso' };
 const uuid = () => crypto.randomUUID();
@@ -81,11 +85,12 @@ async function sqlCliente({ vencimiento, estado = 'activo', createdAt = null }) 
 }
 
 async function seedPago(clienteId, fechaLocal, monto) {
-  await pool.query(
+  const { rows } = await pool.query(
     `INSERT INTO pagos (cliente_id, usuario_id, monto, metodo, periodo_desde, periodo_hasta, fecha_pago)
-     VALUES ($1,$2,$3,'efectivo',$4::date,$4::date + 30,(($4::date + time '12:00') AT TIME ZONE $5))`,
+     VALUES ($1,$2,$3,'efectivo',$4::date,$4::date + 30,(($4::date + time '12:00') AT TIME ZONE $5)) RETURNING id`,
     [clienteId, ctx.adminId, monto, fechaLocal, TZ]
   );
+  await pool.query('INSERT INTO pago_metodos (id_pago, metodo, monto) VALUES ($1,$2,$3)', [rows[0].id, 'efectivo', monto]);
 }
 
 // ───────────────────────── 401: tokens inválidos en TODOS los endpoints ─────────────────────────
@@ -98,6 +103,11 @@ describe('401 en todos los endpoints', () => {
     ['POST', '/api/pagos'], ['GET', `/api/pagos/cliente/${id}`], ['GET', '/api/pagos/stats'],
     ['GET', '/api/dashboard/stats'], ['POST', '/api/upload/foto'],
     ['GET', '/api/usuarios'], ['POST', '/api/usuarios'], ['PUT', `/api/usuarios/${id}`], ['PATCH', `/api/usuarios/${id}/toggle-activo`], ['DELETE', `/api/usuarios/${id}`],
+    ['GET', '/api/productos'], ['GET', `/api/productos/${id}`], ['POST', '/api/productos'], ['PUT', `/api/productos/${id}`],
+    ['PATCH', `/api/productos/${id}/toggle-activo`], ['PATCH', `/api/productos/${id}/stock`], ['DELETE', `/api/productos/${id}`],
+    ['GET', '/api/ventas'], ['GET', `/api/ventas/${id}`], ['GET', '/api/ventas/reportes'], ['POST', '/api/ventas'], ['POST', `/api/ventas/${id}/anular`],
+    ['GET', '/api/caja/movimientos'], ['POST', '/api/caja/movimientos'], ['POST', `/api/caja/movimientos/${id}/anular`],
+    ['GET', '/api/caja/apertura'], ['PUT', '/api/caja/apertura'], ['GET', '/api/caja/cierre'],
   ];
 
   it('sin header, esquema incorrecto, firma ajena, expirado y usuario inexistente', async () => {
@@ -156,6 +166,23 @@ describe('matriz de permisos por endpoint', () => {
     { perms: ['facturacion_ver'], m: 'GET', p: () => '/api/pagos/stats', ok: 200 },
     { perms: ['estadisticas_ver'], m: 'GET', p: () => '/api/dashboard/stats', ok: 200 },
     { perms: ['clientes_crear', 'clientes_editar'], m: 'POST', p: () => '/api/upload/foto', ok: 400 },
+    { perms: ['productos_ver'], m: 'GET', p: () => '/api/productos', ok: 200 },
+    { perms: ['productos_ver'], m: 'GET', p: () => `/api/productos/${uuid()}`, ok: 404 },
+    { perms: ['productos_crear'], m: 'POST', p: () => '/api/productos', body: {}, ok: 400 },
+    { perms: ['productos_editar'], m: 'PUT', p: () => `/api/productos/${uuid()}`, body: {}, ok: 404 },
+    { perms: ['productos_editar'], m: 'PATCH', p: () => `/api/productos/${uuid()}/stock`, body: {}, ok: 400 },
+    { perms: ['productos_eliminar'], m: 'DELETE', p: () => `/api/productos/${uuid()}`, ok: 404 },
+    { perms: ['ventas_ver'], m: 'GET', p: () => '/api/ventas', ok: 200 },
+    { perms: ['ventas_ver'], m: 'GET', p: () => `/api/ventas/${uuid()}`, ok: 404 },
+    { perms: ['ventas_ver'], m: 'GET', p: () => '/api/ventas/reportes', ok: 200 },
+    { perms: ['ventas_registrar'], m: 'POST', p: () => '/api/ventas', body: {}, ok: 400 },
+    { perms: ['ventas_anular'], m: 'POST', p: () => `/api/ventas/${uuid()}/anular`, body: {}, ok: 400 },
+    { perms: ['caja_ver'], m: 'GET', p: () => '/api/caja/movimientos', ok: 200 },
+    { perms: ['caja_movimientos'], m: 'POST', p: () => '/api/caja/movimientos', body: {}, ok: 400 },
+    { perms: ['caja_movimientos'], m: 'POST', p: () => `/api/caja/movimientos/${uuid()}/anular`, body: {}, ok: 400 },
+    { perms: ['caja_ver'], m: 'GET', p: () => '/api/caja/apertura', ok: 200 },
+    { perms: ['caja_movimientos'], m: 'PUT', p: () => '/api/caja/apertura', body: {}, ok: 400 },
+    { perms: ['caja_ver'], m: 'GET', p: () => '/api/caja/cierre', ok: 200 },
   ];
 
   for (const c of casos) {
@@ -684,7 +711,7 @@ describe('facturación: stats contra pagos sembrados', () => {
     const c = await crearCliente();
     const antes = await statsPagos();
     await cobrar(ctx.admin, c.id, 150.25);
-    await cobrar(ctx.admin, c.id, 49.75, 'tarjeta');
+    await cobrar(ctx.admin, c.id, 49.75, 'transferencia');
     const despues = await statsPagos();
     for (const k of ['hoy', 'semana', 'mes']) assert.equal(cents(despues[k] - antes[k]), 20000, k);
   });
@@ -758,16 +785,45 @@ describe('clientes y usuarios: bordes adicionales', () => {
 
 // ───────────────────────── Fase 2: inserta un pago "a mano" sin pasar por el controller,
 // para poder fijar usuario/método/fecha/anulado libremente sin tocar el vencimiento del cliente.
-async function sqlPago({ clienteId, usuarioId, monto, metodo = 'efectivo', fechaLocal, hora = '12:00', anulado = false, periodoDesde, periodoHasta }) {
+async function sqlPago({ clienteId, usuarioId, monto, metodo = 'efectivo', fechaLocal, hora = '12:00', anulado = false, periodoDesde, periodoHasta, desglose }) {
   const desde = periodoDesde ?? fechaLocal;
   const hasta = periodoHasta ?? addDays(fechaLocal, PERIODO_DIAS);
+  const metodoResumen = desglose ? ([...new Set(desglose.map((d) => d.metodo))].length > 1 ? 'mixto' : desglose[0].metodo) : metodo;
   const { rows } = await pool.query(
     `INSERT INTO pagos (cliente_id, usuario_id, monto, metodo, periodo_desde, periodo_hasta, fecha_pago, anulado)
      VALUES ($1,$2,$3,$4,$5::date,$6::date, (($7::date + $8::time) AT TIME ZONE $9), $10)
      RETURNING id`,
-    [clienteId, usuarioId, monto, metodo, desde, hasta, fechaLocal, hora, TZ, anulado]
+    [clienteId, usuarioId, monto, metodoResumen, desde, hasta, fechaLocal, hora, TZ, anulado]
   );
+  for (const f of (desglose ?? [{ metodo, monto }])) {
+    await pool.query('INSERT INTO pago_metodos (id_pago, metodo, monto) VALUES ($1,$2,$3)', [rows[0].id, f.metodo, f.monto]);
+  }
   return rows[0].id;
+}
+
+// Pago/venta sembrados "en el pasado" (fecha arbitraria) para probar el cierre de caja
+// integrado sin pelearse con datos de otros tests corriendo en el mismo día.
+async function sqlPagoEnFecha(fecha, { usuarioId, monto, desglose }) {
+  const cli = await crearCliente();
+  ctx.ids.clientes.push(cli.id);
+  return sqlPago({ clienteId: cli.id, usuarioId, monto, fechaLocal: fecha, desglose });
+}
+
+async function sqlVentaEnFecha(fecha, { usuarioId, productoId, total, pagos, cantidad = 1 }) {
+  const { rows } = await pool.query(
+    `INSERT INTO ventas (id_usuario, total, fecha_hora) VALUES ($1,$2,(($3::date + time '12:00') AT TIME ZONE $4)) RETURNING id`,
+    [usuarioId, total, fecha, TZ]
+  );
+  const ventaId = rows[0].id;
+  await pool.query(
+    `INSERT INTO venta_items (id_venta, id_producto, nombre_snapshot, precio_unitario, cantidad, subtotal)
+     VALUES ($1,$2,'Zztest item',$3::numeric,$4::int,$3::numeric * $4::numeric)`,
+    [ventaId, productoId, total / cantidad, cantidad]
+  );
+  for (const p of pagos) {
+    await pool.query('INSERT INTO venta_pagos (id_venta, metodo, monto) VALUES ($1,$2,$3)', [ventaId, p.metodo, p.monto]);
+  }
+  return ventaId;
 }
 
 const bucketDe = (d) => (d < 0 ? 'moroso' : d <= POR_VENCER_DIAS ? 'por_vencer' : 'al_dia');
@@ -923,7 +979,7 @@ describe('Fase 2: cierre de caja', () => {
     cli = await crearCliente();
 
     await sqlPago({ clienteId: cli.id, usuarioId: empleadoA.id, monto: 100, metodo: 'efectivo', fechaLocal: D });
-    await sqlPago({ clienteId: cli.id, usuarioId: empleadoA.id, monto: 50, metodo: 'tarjeta', fechaLocal: D });
+    await sqlPago({ clienteId: cli.id, usuarioId: empleadoA.id, monto: 50, metodo: 'transferencia', fechaLocal: D });
     await sqlPago({ clienteId: cli.id, usuarioId: empleadoB.id, monto: 200, metodo: 'transferencia', fechaLocal: D });
     await sqlPago({ clienteId: cli.id, usuarioId: empleadoA.id, monto: 999, metodo: 'efectivo', fechaLocal: D, anulado: true });
 
@@ -958,7 +1014,7 @@ describe('Fase 2: cierre de caja', () => {
     const a = data.porEmpleado.find((x) => x.usuarioId === empleadoA.id);
     assert.equal(a.monto, 150);
     assert.equal(a.cantidad, 2);
-    assert.deepEqual(a.porMetodo.map((x) => x.metodo).sort(), ['efectivo', 'tarjeta']);
+    assert.deepEqual(a.porMetodo.map((x) => x.metodo).sort(), ['efectivo', 'transferencia']);
     assert.equal(a.porMetodo.find((x) => x.metodo === 'efectivo').monto, 100, 'el anulado no se suma al vigente');
 
     const b = data.porEmpleado.find((x) => x.usuarioId === empleadoB.id);
@@ -1084,5 +1140,510 @@ describe('Fase 2: anular un pago actualiza cierre de caja y morosos', () => {
     assert.equal((await api('POST', `/api/pagos/${crypto.randomUUID()}/anular`, { token: ctx.admin, body: { motivo: 'x' } })).status, 404);
     assert.equal((await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'ok' } })).status, 200);
     assert.equal((await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'otra vez' } })).status, 409);
+  });
+});
+
+// ═══════════════════════════ Fase 3+: Productos, Ventas (pago dividido) y Caja ═══════════════════════════
+const { crearProducto, productoBase } = H;
+
+async function crearVenta(token, { items, pagos, idCliente } = {}) {
+  return api('POST', '/api/ventas', { token, body: { items, pagos, ...(idCliente ? { idCliente } : {}) } });
+}
+
+describe('Productos: validaciones, duplicados, listado y stock', () => {
+  it('validaciones de alta: nombre, precio, descripción', async () => {
+    const post = (body) => api('POST', '/api/productos', { token: ctx.admin, body: productoBase(body) });
+    assertErrores(await post({ nombre: 'A' }), ['nombre']);
+    assertErrores(await post({ nombre: 'x'.repeat(61) }), ['nombre']);
+    assertErrores(await post({ nombre: 'Café_Especial' }), ['nombre']); // guion bajo no permitido
+    assertErrores(await post({ precio: 0 }), ['precio']);
+    assertErrores(await post({ precio: -5 }), ['precio']);
+    assertErrores(await post({ precio: 10.123 }), ['precio']);
+    assertErrores(await post({ precio: 'abc' }), ['precio']);
+    assertErrores(await post({ descripcion: 'x'.repeat(201) }), ['descripcion']);
+    assertErrores(await api('POST', '/api/productos', { token: ctx.admin, body: {} }), ['nombre', 'precio']);
+  });
+
+  it('alta válida acepta letras, números y espacios; activo = true por defecto', async () => {
+    const p = await crearProducto({ nombre: `Zztest Agua 500ml ${randLetters(4)}` });
+    assert.equal(p.activo, true);
+    assert.equal(p.controlaStock, false);
+    assert.equal(p.stockActual, null);
+  });
+
+  it('nombre duplicado (sin importar mayúsculas) -> 409', async () => {
+    const p = await crearProducto();
+    const dup = await api('POST', '/api/productos', { token: ctx.admin, body: productoBase({ nombre: p.nombre.toUpperCase() }) });
+    assert.equal(dup.status, 409, dup.text);
+    assert.ok(dup.body.errors.nombre);
+  });
+
+  it('desactivar ("eliminar") y reactivar con toggle-activo; reactivar no permite nombre duplicado', async () => {
+    const p = await crearProducto();
+    const off = await api('DELETE', `/api/productos/${p.id}`, { token: ctx.admin });
+    assert.equal(off.status, 200, off.text);
+    assert.equal(off.body.data.activo, false);
+
+    const on = await api('PATCH', `/api/productos/${p.id}/toggle-activo`, { token: ctx.admin });
+    assert.equal(on.body.data.activo, true);
+
+    // un producto nuevo no puede robarle el nombre a uno desactivado
+    await api('DELETE', `/api/productos/${p.id}`, { token: ctx.admin });
+    const otro = await api('POST', '/api/productos', { token: ctx.admin, body: productoBase({ nombre: p.nombre }) });
+    assert.equal(otro.status, 409, otro.text);
+  });
+
+  it('update: cambia precio/categoría; nombre duplicado contra otro producto -> 409; inexistente -> 404', async () => {
+    const p = await crearProducto();
+    const upd = await api('PUT', `/api/productos/${p.id}`, { token: ctx.admin, body: productoBase({ nombre: p.nombre, precio: 55.5, categoria: 'Bebidas' }) });
+    assert.equal(upd.status, 200, upd.text);
+    assert.equal(Number(upd.body.data.precio), 55.5);
+    assert.equal(upd.body.data.categoria, 'Bebidas');
+
+    const otro = await crearProducto();
+    const dup = await api('PUT', `/api/productos/${otro.id}`, { token: ctx.admin, body: productoBase({ nombre: p.nombre }) });
+    assert.equal(dup.status, 409, dup.text);
+
+    assert.equal((await api('PUT', `/api/productos/${uuid()}`, { token: ctx.admin, body: productoBase() })).status, 404);
+  });
+
+  it('listado: búsqueda por nombre, filtro activo/inactivo y paginación', async () => {
+    const marker = `Zztest${randLetters(10)}`;
+    const activo = await crearProducto({ nombre: `${marker} Activo` });
+    const inactivo = await crearProducto({ nombre: `${marker} Inactivo` });
+    await api('DELETE', `/api/productos/${inactivo.id}`, { token: ctx.admin });
+
+    const todos = await api('GET', `/api/productos?query=${encodeURIComponent(marker)}`, { token: ctx.admin });
+    assert.equal(todos.body.meta.total, 2);
+
+    const soloActivos = await api('GET', `/api/productos?query=${encodeURIComponent(marker)}&activo=true`, { token: ctx.admin });
+    assert.deepEqual(soloActivos.body.data.map((x) => x.id), [activo.id]);
+
+    const soloInactivos = await api('GET', `/api/productos?query=${encodeURIComponent(marker)}&activo=false`, { token: ctx.admin });
+    assert.deepEqual(soloInactivos.body.data.map((x) => x.id), [inactivo.id]);
+  });
+
+  it('ajuste manual de stock: incrementa, decrementa, rechaza negativo y queda auditado', async () => {
+    const p = await crearProducto({ controlaStock: true, stockActual: 10 });
+    const inc = await api('PATCH', `/api/productos/${p.id}/stock`, { token: ctx.admin, body: { delta: 5, motivo: 'reposición' } });
+    assert.equal(inc.status, 200, inc.text);
+    assert.equal(inc.body.data.stockActual, 15);
+
+    const dec = await api('PATCH', `/api/productos/${p.id}/stock`, { token: ctx.admin, body: { delta: -3 } });
+    assert.equal(dec.body.data.stockActual, 12);
+
+    const insuf = await api('PATCH', `/api/productos/${p.id}/stock`, { token: ctx.admin, body: { delta: -999 } });
+    assert.equal(insuf.status, 409, insuf.text);
+
+    const cero = await api('PATCH', `/api/productos/${p.id}/stock`, { token: ctx.admin, body: { delta: 0 } });
+    assert.equal(cero.status, 400);
+
+    const { rows } = await pool.query(
+      `SELECT tipo, cantidad FROM movimientos_stock WHERE id_producto = $1 AND tipo = 'ajuste' ORDER BY fecha_hora`, [p.id]
+    );
+    assert.deepEqual(rows.map((r) => r.cantidad), [5, -3]);
+  });
+
+  it('ajuste de stock sobre un producto que no controla stock -> 409', async () => {
+    const p = await crearProducto();
+    assert.equal((await api('PATCH', `/api/productos/${p.id}/stock`, { token: ctx.admin, body: { delta: 1 } })).status, 409);
+  });
+});
+
+describe('Ventas: precio del servidor, pago dividido, stock y atomicidad', () => {
+  it('validaciones: items y pagos vacíos/inválidos -> 400', async () => {
+    assertErrores(await crearVenta(ctx.admin, {}), ['items', 'pagos']);
+    assertErrores(await crearVenta(ctx.admin, { items: [], pagos: [] }), ['items', 'pagos']);
+    const p = await crearProducto();
+    assertErrores(await crearVenta(ctx.admin, { items: [{ idProducto: 'no-uuid', cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 1 }] }), ['items']);
+    assertErrores(await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 0 }], pagos: [{ metodo: 'efectivo', monto: 1 }] }), ['items']);
+    assertErrores(await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'bitcoin', monto: 1 }] }), ['pagos']);
+    assertErrores(await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: -1 }] }), ['pagos']);
+  });
+
+  it('producto inexistente -> 404; producto inactivo -> 409', async () => {
+    const r404 = await crearVenta(ctx.admin, { items: [{ idProducto: uuid(), cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 100 }] });
+    assert.equal(r404.status, 404, r404.text);
+
+    const p = await crearProducto();
+    await api('DELETE', `/api/productos/${p.id}`, { token: ctx.admin });
+    const r409 = await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: Number(p.precio) }] });
+    assert.equal(r409.status, 409, r409.text);
+  });
+
+  it('el precio SIEMPRE lo calcula el servidor: un precio manipulado en el body se ignora', async () => {
+    const p = await crearProducto({ precio: 77.5 });
+    const r = await crearVenta(ctx.admin, {
+      items: [{ idProducto: p.id, cantidad: 2, precio: 0.01 }],
+      pagos: [{ metodo: 'efectivo', monto: 155 }],
+    });
+    assert.equal(r.status, 201, r.text);
+    assert.equal(Number(r.body.data.total), 155);
+    assert.equal(Number(r.body.data.items[0].precioUnitario), 77.5);
+  });
+
+  it('pagos que no suman el total -> 400 (sin crear nada)', async () => {
+    const p = await crearProducto({ precio: 100 });
+    const r = await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 99 }] });
+    assert.equal(r.status, 400, r.text);
+    assert.ok(r.body.errors.pagos);
+  });
+
+  it('pago dividido: la venta queda con las filas de venta_pagos correctas', async () => {
+    const p = await crearProducto({ precio: 100 });
+    const r = await crearVenta(ctx.admin, {
+      items: [{ idProducto: p.id, cantidad: 3 }],
+      pagos: [{ metodo: 'efectivo', monto: 200 }, { metodo: 'transferencia', monto: 100 }],
+    });
+    assert.equal(r.status, 201, r.text);
+    assert.equal(Number(r.body.data.total), 300);
+    const porMetodo = Object.fromEntries(r.body.data.pagos.map((x) => [x.metodo, Number(x.monto)]));
+    assert.deepEqual(porMetodo, { efectivo: 200, transferencia: 100 });
+  });
+
+  it('snapshot: cambiar el precio del producto después no altera ventas viejas', async () => {
+    const p = await crearProducto({ precio: 50 });
+    const venta1 = await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 50 }] });
+    await api('PUT', `/api/productos/${p.id}`, { token: ctx.admin, body: productoBase({ nombre: p.nombre, precio: 999 }) });
+    const relectura = await api('GET', `/api/ventas/${venta1.body.data.id}`, { token: ctx.admin });
+    assert.equal(Number(relectura.body.data.items[0].precioUnitario), 50);
+    assert.equal(Number(relectura.body.data.total), 50);
+  });
+
+  it('stock: se descuenta solo si controla_stock, insuficiente -> 409, se restituye al anular', async () => {
+    const conStock = await crearProducto({ controlaStock: true, stockActual: 5, precio: 10 });
+    const sinStock = await crearProducto({ precio: 10 }); // controla_stock: false
+
+    // vender más de lo que hay -> 409 y no se descuenta nada
+    const insuf = await crearVenta(ctx.admin, { items: [{ idProducto: conStock.id, cantidad: 6 }], pagos: [{ metodo: 'efectivo', monto: 60 }] });
+    assert.equal(insuf.status, 409, insuf.text);
+    assert.equal(insuf.body.productoId, conStock.id);
+    assert.equal((await api('GET', `/api/productos/${conStock.id}`, { token: ctx.admin })).body.data.stockActual, 5);
+
+    const r = await crearVenta(ctx.admin, {
+      items: [{ idProducto: conStock.id, cantidad: 2 }, { idProducto: sinStock.id, cantidad: 3 }],
+      pagos: [{ metodo: 'efectivo', monto: 50 }],
+    });
+    assert.equal(r.status, 201, r.text);
+    assert.equal((await api('GET', `/api/productos/${conStock.id}`, { token: ctx.admin })).body.data.stockActual, 3);
+    assert.equal((await api('GET', `/api/productos/${sinStock.id}`, { token: ctx.admin })).body.data.stockActual, null);
+
+    const anular = await api('POST', `/api/ventas/${r.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'prueba' } });
+    assert.equal(anular.status, 200, anular.text);
+    assert.equal((await api('GET', `/api/productos/${conStock.id}`, { token: ctx.admin })).body.data.stockActual, 5, 'stock restituido');
+
+    const { rows } = await pool.query(
+      `SELECT tipo, cantidad FROM movimientos_stock WHERE id_producto = $1 ORDER BY fecha_hora`, [conStock.id]
+    );
+    assert.deepEqual(rows.map((x) => x.tipo), ['venta', 'anulacion_venta']);
+    assert.deepEqual(rows.map((x) => x.cantidad), [-2, 2]);
+  });
+
+  it('atomicidad: si un ítem falla (producto inexistente), no queda ninguna venta ni se toca el stock del primero', async () => {
+    const conStock = await crearProducto({ controlaStock: true, stockActual: 10, precio: 10 });
+    const antes = (await pool.query('SELECT COUNT(*)::int AS n FROM ventas')).rows[0].n;
+
+    const r = await crearVenta(ctx.admin, {
+      items: [{ idProducto: conStock.id, cantidad: 1 }, { idProducto: uuid(), cantidad: 1 }],
+      pagos: [{ metodo: 'efectivo', monto: 10 }],
+    });
+    assert.equal(r.status, 404, r.text);
+
+    const despues = (await pool.query('SELECT COUNT(*)::int AS n FROM ventas')).rows[0].n;
+    assert.equal(despues, antes, 'no se insertó ninguna venta');
+    assert.equal((await api('GET', `/api/productos/${conStock.id}`, { token: ctx.admin })).body.data.stockActual, 10, 'el stock del primer ítem no se tocó');
+  });
+
+  it('doble anulación -> 409; anular venta inexistente -> 404; permiso ventas_anular distinto de ventas_registrar', async () => {
+    const p = await crearProducto({ precio: 20 });
+    const r = await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 20 }] });
+    assert.equal((await api('POST', `/api/ventas/${uuid()}/anular`, { token: ctx.admin, body: { motivo: 'x' } })).status, 404);
+
+    const sinAnular = await dbRole(`Zztest${randLetters()}`, ['ventas_registrar', 'ventas_ver']);
+    const email = testEmail('sinanularventa');
+    await dbUser({ nombre: 'Sin Anular Venta', email, idRol: sinAnular });
+    const t = await login(email);
+    assert.equal((await api('POST', `/api/ventas/${r.body.data.id}/anular`, { token: t, body: { motivo: 'x' } })).status, 403);
+
+    const ok = await api('POST', `/api/ventas/${r.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'ok' } });
+    assert.equal(ok.status, 200, ok.text);
+    assert.equal((await api('POST', `/api/ventas/${r.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'otra vez' } })).status, 409);
+  });
+
+  it('listado: filtra por fecha/empleado/anuladas y pagina', async () => {
+    const p = await crearProducto({ precio: 15 });
+    const v1 = await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 15 }] });
+    const lista = await api('GET', `/api/ventas?usuarioId=${ctx.adminId}`, { token: ctx.admin });
+    assert.equal(lista.status, 200, lista.text);
+    assert.ok(lista.body.data.some((x) => x.id === v1.body.data.id));
+    assert.equal((await api('GET', '/api/ventas?anuladas=true', { token: ctx.admin })).status, 200);
+    assert.equal((await api('GET', '/api/ventas?desde=no-es-fecha', { token: ctx.admin })).status, 400);
+  });
+
+  it('reportes: unidades e ingreso por producto, ventas por día', async () => {
+    const h = hoyISO();
+    const p = await crearProducto({ precio: 25 });
+    await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 4 }], pagos: [{ metodo: 'efectivo', monto: 100 }] });
+    const anulada = await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 2 }], pagos: [{ metodo: 'efectivo', monto: 50 }] });
+    await api('POST', `/api/ventas/${anulada.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'no cuenta' } });
+
+    const r = await api('GET', `/api/ventas/reportes?desde=${h}&hasta=${h}`, { token: ctx.admin });
+    assert.equal(r.status, 200, r.text);
+    const fila = r.body.data.porProducto.find((x) => x.idProducto === p.id);
+    assert.equal(fila.unidades, 4, 'la anulada no suma unidades');
+    assert.equal(fila.ingreso, 100);
+    const dia = r.body.data.porDia.find((x) => x.fecha === h);
+    assert.ok(dia.total >= 100);
+  });
+
+  it('una venta vigente nunca viaja con anulada: null (toCamelCase recursivo no debe pisar booleans en false)', async () => {
+    const p = await crearProducto({ precio: 10 });
+    const r = await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 10 }] });
+    assert.equal(r.body.data.anulada, false);
+    const relectura = await api('GET', `/api/ventas/${r.body.data.id}`, { token: ctx.admin });
+    assert.equal(relectura.body.data.anulada, false);
+  });
+
+  it('usuarioNombre y clienteNombreCompleto vienen con el mismo shape en el detalle y en el listado', async () => {
+    const h = hoyISO();
+    const cli = await crearCliente();
+    const p = await crearProducto({ precio: 10 });
+    const r = await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 10 }], idCliente: cli.id });
+    assert.ok(r.body.data.usuarioNombre, 'el detalle de la venta recién creada trae usuarioNombre');
+    assert.equal(r.body.data.clienteNombreCompleto, `${cli.apellido}, ${cli.nombre}`);
+
+    const detalle = await api('GET', `/api/ventas/${r.body.data.id}`, { token: ctx.admin });
+    assert.equal(detalle.body.data.usuarioNombre, r.body.data.usuarioNombre);
+    assert.equal(detalle.body.data.clienteNombreCompleto, r.body.data.clienteNombreCompleto);
+
+    const lista = await api('GET', `/api/ventas?desde=${h}&hasta=${h}`, { token: ctx.admin });
+    const enLista = lista.body.data.find((x) => x.id === r.body.data.id);
+    assert.equal(enLista.usuarioNombre, r.body.data.usuarioNombre);
+    assert.equal(enLista.clienteNombreCompleto, r.body.data.clienteNombreCompleto);
+  });
+});
+
+describe('Cuotas: pago dividido (pagos[]) y compatibilidad con el front viejo', () => {
+  it('un solo método en pagos[] se comporta igual que el campo metodo legacy', async () => {
+    const c = await crearCliente();
+    const r = await api('POST', '/api/pagos', { token: ctx.admin, body: { clienteId: c.id, monto: 300, pagos: [{ metodo: 'efectivo', monto: 300 }] } });
+    assert.equal(r.status, 201, r.text);
+    assert.equal(r.body.data.metodo, 'efectivo');
+    assert.deepEqual(r.body.data.metodos.map((m) => m.metodo), ['efectivo']);
+  });
+
+  it('dos métodos -> pagos.metodo = "mixto" y dos filas en pago_metodos', async () => {
+    const c = await crearCliente();
+    const r = await api('POST', '/api/pagos', { token: ctx.admin, body: {
+      clienteId: c.id, monto: 1000, pagos: [{ metodo: 'efectivo', monto: 600 }, { metodo: 'transferencia', monto: 400 }],
+    } });
+    assert.equal(r.status, 201, r.text);
+    assert.equal(r.body.data.metodo, 'mixto');
+    const porMetodo = Object.fromEntries(r.body.data.metodos.map((m) => [m.metodo, Number(m.monto)]));
+    assert.deepEqual(porMetodo, { efectivo: 600, transferencia: 400 });
+  });
+
+  it('pagos[] cuya suma no coincide con el monto -> 400', async () => {
+    const c = await crearCliente();
+    const r = await api('POST', '/api/pagos', { token: ctx.admin, body: {
+      clienteId: c.id, monto: 1000, pagos: [{ metodo: 'efectivo', monto: 600 }, { metodo: 'transferencia', monto: 300 }],
+    } });
+    assert.equal(r.status, 400, r.text);
+    assert.ok(r.body.errors.pagos);
+  });
+
+  it('sin metodo ni pagos[] -> 400; metodo inválido ("tarjeta" ya no existe) -> 400', async () => {
+    const c = await crearCliente();
+    assertErrores(await api('POST', '/api/pagos', { token: ctx.admin, body: { clienteId: c.id, monto: 100 } }), ['metodo']);
+    assertErrores(await api('POST', '/api/pagos', { token: ctx.admin, body: { clienteId: c.id, monto: 100, metodo: 'tarjeta' } }), ['metodo']);
+  });
+
+  it('toda cuota (incluso las sembradas antes de la migración) tiene desglose en pago_metodos', async () => {
+    const { rows } = await pool.query(
+      `SELECT p.id FROM pagos p WHERE NOT EXISTS (SELECT 1 FROM pago_metodos pm WHERE pm.id_pago = p.id)`
+    );
+    assert.equal(rows.length, 0, 'ningún pago debería quedar sin desglose');
+  });
+
+  it('el backup de pagos previo a la migración coincide con lo que hoy hay backfillado en pago_metodos', async () => {
+    const backup = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'backup_pagos_2026-10-08.json'), 'utf8'));
+    for (const row of backup) {
+      const { rows } = await pool.query('SELECT metodo, monto FROM pago_metodos WHERE id_pago = $1', [row.id]);
+      assert.equal(rows.length, 1, `pago ${row.id} debería tener exactamente 1 fila de desglose`);
+      assert.equal(rows[0].metodo, row.metodo);
+      assert.equal(Number(rows[0].monto), Number(row.monto));
+    }
+  });
+
+  it('GET /pagos/cliente y GET /pagos devuelven el desglose (metodos)', async () => {
+    const c = await crearCliente();
+    await api('POST', '/api/pagos', { token: ctx.admin, body: { clienteId: c.id, monto: 500, metodo: 'transferencia' } });
+    const hist = await api('GET', `/api/pagos/cliente/${c.id}`, { token: ctx.admin });
+    assert.ok(Array.isArray(hist.body.data[0].metodos));
+    assert.equal(hist.body.data[0].metodos[0].metodo, 'transferencia');
+
+    const lista = await api('GET', `/api/pagos?clienteQuery=${c.dni}`, { token: ctx.admin });
+    assert.ok(Array.isArray(lista.body.data[0].metodos));
+  });
+
+  it('anular una cuota dividida sigue funcionando (el desglose queda, el cliente vuelve al estado anterior)', async () => {
+    const h = hoyISO();
+    const c = await crearCliente({ fechaVencimiento: addDays(h, 10) });
+    const cobro = await api('POST', '/api/pagos', { token: ctx.admin, body: {
+      clienteId: c.id, monto: 1000, pagos: [{ metodo: 'efectivo', monto: 500 }, { metodo: 'transferencia', monto: 500 }],
+    } });
+    assert.equal(cobro.status, 201, cobro.text);
+    const anular = await api('POST', `/api/pagos/${cobro.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'x' } });
+    assert.equal(anular.status, 200, anular.text);
+    const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM pago_metodos WHERE id_pago = $1', [cobro.body.data.id]);
+    assert.equal(rows[0].n, 2, 'el desglose de un pago anulado no se borra');
+  });
+});
+
+describe('Caja: egresos/ingresos extra y apertura', () => {
+  it('validaciones de alta de movimiento', async () => {
+    const post = (body) => api('POST', '/api/caja/movimientos', { token: ctx.admin, body });
+    assertErrores(await post({}), ['tipo', 'concepto', 'monto', 'metodo']);
+    assertErrores(await post({ tipo: 'invalido', concepto: 'x', monto: 10, metodo: 'efectivo' }), ['tipo']);
+    assertErrores(await post({ tipo: 'egreso', concepto: 'x', monto: -10, metodo: 'efectivo' }), ['monto']);
+    assertErrores(await post({ tipo: 'egreso', concepto: 'x', monto: 10, metodo: 'bitcoin' }), ['metodo']);
+  });
+
+  it('crear, listar por fecha y anular con motivo; doble anulación -> 409', async () => {
+    const h = hoyISO();
+    const mov = await api('POST', '/api/caja/movimientos', { token: ctx.admin, body: { tipo: 'egreso', concepto: 'Zztest insumos', monto: 123.45, metodo: 'efectivo' } });
+    assert.equal(mov.status, 201, mov.text);
+
+    const lista = await api('GET', `/api/caja/movimientos?fecha=${h}`, { token: ctx.admin });
+    assert.ok(lista.body.data.some((x) => x.id === mov.body.data.id));
+
+    assertErrores(await api('POST', `/api/caja/movimientos/${mov.body.data.id}/anular`, { token: ctx.admin, body: {} }), ['motivo']);
+    assert.equal((await api('POST', `/api/caja/movimientos/${uuid()}/anular`, { token: ctx.admin, body: { motivo: 'x' } })).status, 404);
+
+    const anular = await api('POST', `/api/caja/movimientos/${mov.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'error de tipeo' } });
+    assert.equal(anular.status, 200, anular.text);
+    assert.equal((await api('POST', `/api/caja/movimientos/${mov.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'x' } })).status, 409);
+  });
+
+  it('caja_ver permite listar pero no crear/anular; caja_movimientos permite todo', async () => {
+    const soloVer = await dbRole(`Zztest${randLetters()}`, ['caja_ver']);
+    const email = testEmail('cajaver');
+    await dbUser({ nombre: 'Caja Ver', email, idRol: soloVer });
+    const t = await login(email);
+    assert.equal((await api('GET', '/api/caja/movimientos', { token: t })).status, 200);
+    assert.equal((await api('POST', '/api/caja/movimientos', { token: t, body: {} })).status, 403);
+  });
+
+  it('apertura: GET/PUT por fecha, upsert (una por día)', async () => {
+    const fecha = addDays(hoyISO(), -1500);
+    const vacia = await api('GET', `/api/caja/apertura?fecha=${fecha}`, { token: ctx.admin });
+    assert.equal(vacia.body.data, null);
+
+    const put1 = await api('PUT', '/api/caja/apertura', { token: ctx.admin, body: { fecha, montoInicialEfectivo: 1000 } });
+    assert.equal(put1.status, 200, put1.text);
+    assert.equal(Number(put1.body.data.montoInicialEfectivo), 1000);
+
+    const put2 = await api('PUT', '/api/caja/apertura', { token: ctx.admin, body: { fecha, montoInicialEfectivo: 1500.50 } });
+    assert.equal(Number(put2.body.data.montoInicialEfectivo), 1500.50);
+
+    const get = await api('GET', `/api/caja/apertura?fecha=${fecha}`, { token: ctx.admin });
+    assert.equal(Number(get.body.data.montoInicialEfectivo), 1500.50);
+
+    // 0 es un valor válido (caja en cero)
+    const cero = await api('PUT', '/api/caja/apertura', { token: ctx.admin, body: { fecha, montoInicialEfectivo: 0 } });
+    assert.equal(cero.status, 200, cero.text);
+
+    assertErrores(await api('PUT', '/api/caja/apertura', { token: ctx.admin, body: { montoInicialEfectivo: -1 } }), ['montoInicialEfectivo']);
+  });
+});
+
+describe('Cierre de caja integrado (/api/caja/cierre)', () => {
+  const FECHA = addDays(hoyISO(), -2000);
+  let empleado, producto1;
+
+  before(async () => {
+    const rolId = await dbRole(`Zztest${randLetters()}`, ['facturacion_ver', 'ventas_ver', 'caja_ver']);
+    empleado = { email: testEmail('cierreint') };
+    empleado.id = await dbUser({ nombre: 'Cierre Integrado', email: empleado.email, idRol: rolId });
+    empleado.token = await login(empleado.email);
+
+    producto1 = await crearProducto({ precio: 100 });
+
+    await cajaApertura.upsert({ fecha: FECHA, monto_inicial_efectivo: 1000, usuario_id: empleado.id });
+    // cuota mixta: 60 efectivo + 40 transferencia
+    await sqlPagoEnFecha(FECHA, { usuarioId: empleado.id, monto: 100, desglose: [{ metodo: 'efectivo', monto: 60 }, { metodo: 'transferencia', monto: 40 }] });
+    // venta dividida: 70 efectivo + 30 transferencia, vía SQL directo para fijar la fecha
+    await sqlVentaEnFecha(FECHA, { usuarioId: empleado.id, productoId: producto1.id, total: 100, pagos: [{ metodo: 'efectivo', monto: 70 }, { metodo: 'transferencia', monto: 30 }] });
+    // egreso efectivo
+    await movimientoCaja.create({ tipo: 'egreso', concepto: 'Zztest alquiler', monto: 50, metodo: 'efectivo', usuario_id: empleado.id });
+    await pool.query(`UPDATE movimientos_caja SET fecha_hora = (($1::date + time '12:00') AT TIME ZONE $2) WHERE id_usuario = $3 AND concepto = 'Zztest alquiler'`, [FECHA, TZ, empleado.id]);
+    // ingreso extra transferencia
+    await movimientoCaja.create({ tipo: 'ingreso_extra', concepto: 'Zztest varios', monto: 20, metodo: 'transferencia', usuario_id: empleado.id });
+    await pool.query(`UPDATE movimientos_caja SET fecha_hora = (($1::date + time '12:00') AT TIME ZONE $2) WHERE id_usuario = $3 AND concepto = 'Zztest varios'`, [FECHA, TZ, empleado.id]);
+  });
+
+  it('efectivoEsperado y transferenciasTotal cierran matemáticamente contra los datos sembrados', async () => {
+    const r = await api('GET', `/api/caja/cierre?fecha=${FECHA}`, { token: ctx.admin });
+    assert.equal(r.status, 200, r.text);
+    const d = r.body.data;
+    assert.equal(d.aperturaInicialEfectivo, 1000);
+    assert.equal(d.porTipo.cuotas.efectivo, 60);
+    assert.equal(d.porTipo.cuotas.transferencia, 40);
+    assert.equal(d.porTipo.ventas.efectivo, 70);
+    assert.equal(d.porTipo.ventas.transferencia, 30);
+    assert.equal(d.porTipo.egresos.efectivo, 50);
+    assert.equal(d.porTipo.ingresosExtra.transferencia, 20);
+    // 1000 + 60 (cuota efectivo) + 70 (venta efectivo) + 0 (ingresos extra efectivo) - 50 (egreso efectivo)
+    assert.equal(d.efectivoEsperado, 1080);
+    // 40 (cuota transf) + 30 (venta transf) + 20 (ingreso extra transf) - 0 (egreso transf)
+    assert.equal(d.transferenciasTotal, 90);
+  });
+
+  it('un Empleado ve solo lo suyo en el cierre integrado', async () => {
+    const otroRolId = await dbRole(`Zztest${randLetters()}`, ['facturacion_ver', 'ventas_ver', 'caja_ver']);
+    const otroEmail = testEmail('cierreintotro');
+    const otroId = await dbUser({ nombre: 'Otro Empleado', email: otroEmail, idRol: otroRolId });
+    const otroToken = await login(otroEmail);
+    await sqlPagoEnFecha(FECHA, { usuarioId: otroId, monto: 500, desglose: [{ metodo: 'efectivo', monto: 500 }] });
+
+    const soloPropio = await api('GET', `/api/caja/cierre?fecha=${FECHA}`, { token: empleado.token });
+    assert.equal(soloPropio.body.data.porTipo.cuotas.efectivo, 60, 'no ve los 500 del otro empleado');
+
+    const admin = await api('GET', `/api/caja/cierre?fecha=${FECHA}`, { token: ctx.admin });
+    assert.equal(admin.body.data.porTipo.cuotas.efectivo, 560, 'admin ve todo');
+  });
+
+  it('anulados (cuotas y ventas) quedan reportados aparte y no afectan los totales vigentes', async () => {
+    const h = hoyISO();
+    const p = await crearProducto({ precio: 40 });
+    const venta = await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 40 }] });
+    const antes = await api('GET', `/api/caja/cierre?fecha=${h}`, { token: ctx.admin });
+    await api('POST', `/api/ventas/${venta.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'x' } });
+    const despues = await api('GET', `/api/caja/cierre?fecha=${h}`, { token: ctx.admin });
+    assert.equal(despues.body.data.porTipo.ventas.efectivo, antes.body.data.porTipo.ventas.efectivo - 40);
+    assert.ok(despues.body.data.anulados.ventas.monto >= 40);
+  });
+
+  it('medianoche Tucumán: un movimiento a las 23:59:30 local pertenece al día local, no al UTC', async () => {
+    const D = addDays(hoyISO(), -2050);
+    await movimientoCaja.create({ tipo: 'egreso', concepto: 'Zztest medianoche', monto: 15, metodo: 'efectivo', usuario_id: ctx.adminId });
+    await pool.query(`UPDATE movimientos_caja SET fecha_hora = (($1::date + time '23:59:30') AT TIME ZONE $2) WHERE id_usuario = $3 AND concepto = 'Zztest medianoche'`, [D, TZ, ctx.adminId]);
+    const r = await api('GET', `/api/caja/cierre?fecha=${D}`, { token: ctx.admin });
+    assert.equal(r.body.data.porTipo.egresos.efectivo, 15);
+    const rDiaSiguiente = await api('GET', `/api/caja/cierre?fecha=${addDays(D, 1)}`, { token: ctx.admin });
+    assert.equal(rDiaSiguiente.body.data.porTipo.egresos.efectivo, 0);
+  });
+});
+
+describe('Dashboard: ventasHoy', () => {
+  it('ventasHoyTotal/ventasHoyCantidad suman exactamente las ventas de hoy no anuladas', async () => {
+    const antes = await statsDash();
+    const p = await crearProducto({ precio: 33 });
+    await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 33 }] });
+    const anulada = await crearVenta(ctx.admin, { items: [{ idProducto: p.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 33 }] });
+    await api('POST', `/api/ventas/${anulada.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'x' } });
+    const despues = await statsDash();
+    assert.equal(cents(despues.ventasHoyTotal - antes.ventasHoyTotal), 3300, 'la anulada no suma');
+    assert.equal(despues.ventasHoyCantidad - antes.ventasHoyCantidad, 1);
   });
 });
