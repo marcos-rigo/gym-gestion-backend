@@ -21,6 +21,7 @@ const usuarioModel = require('../src/models/usuario');
 const clienteModel = require('../src/models/cliente');
 const movimientoCaja = require('../src/models/movimientoCaja');
 const cajaApertura = require('../src/models/cajaApertura');
+const { turnoDeFecha, turnoSql } = require('../src/utils/turno');
 
 const inproc = { skip: external && 'requiere app en proceso' };
 const uuid = () => crypto.randomUUID();
@@ -1645,5 +1646,313 @@ describe('Dashboard: ventasHoy', () => {
     const despues = await statsDash();
     assert.equal(cents(despues.ventasHoyTotal - antes.ventasHoyTotal), 3300, 'la anulada no suma');
     assert.equal(despues.ventasHoyCantidad - antes.ventasHoyCantidad, 1);
+  });
+});
+
+// ───────────────────────── Turnos: corte de 15:00, filtros y cierre por turno ─────────────────────────
+describe('Turnos: corte de 15:00, filtros y cierre por turno', () => {
+  const F = addDays(hoyISO(), -4100); // día sin datos reales
+  const F2 = addDays(F, -1);
+  const enc = (t) => encodeURIComponent(t);
+  let empA, empB, cli, cli2;
+
+  before(async () => {
+    const rolId = await dbRole(`Zztest${randLetters()}`, []);
+    empA = { id: await dbUser({ nombre: 'Turno Ana', email: testEmail('turnoA'), idRol: rolId }) };
+    empB = { id: await dbUser({ nombre: 'Turno Bruno', email: testEmail('turnoB'), idRol: rolId }) };
+    cli = await crearCliente();
+    cli2 = await crearCliente();
+
+    // Mañana de F: 08:00 y el borde 14:59:59 (efectivo + transferencia).
+    await sqlPago({ clienteId: cli.id, usuarioId: empA.id, monto: 100, metodo: 'efectivo', fechaLocal: F, hora: '08:00:00' });
+    await sqlPago({ clienteId: cli.id, usuarioId: empA.id, monto: 50, metodo: 'transferencia', fechaLocal: F, hora: '14:59:59' });
+    // Tarde de F: el borde 15:00:00 (efectivo) y un cobro mixto a las 20:00.
+    await sqlPago({ clienteId: cli.id, usuarioId: empB.id, monto: 70, metodo: 'efectivo', fechaLocal: F, hora: '15:00:00' });
+    await sqlPago({ clienteId: cli.id, usuarioId: empB.id, monto: 200, fechaLocal: F, hora: '20:00:00',
+      desglose: [{ metodo: 'efectivo', monto: 120 }, { metodo: 'transferencia', monto: 80 }] });
+    // Anulado en mañana: no debe contar en el cierre ni en estado=vigente.
+    await sqlPago({ clienteId: cli.id, usuarioId: empA.id, monto: 999, metodo: 'efectivo', fechaLocal: F, hora: '10:00:00', anulado: true });
+    // Otro día, mismo turno mañana: no debe bloquear ni mezclarse con F.
+    await sqlPago({ clienteId: cli2.id, usuarioId: empA.id, monto: 40, metodo: 'efectivo', fechaLocal: F2, hora: '09:00:00' });
+
+    // Movimientos de caja a ambos lados del corte.
+    for (const [hora, tipo] of [['14:59:59', 'egreso'], ['15:00:00', 'ingreso_extra']]) {
+      const m = await movimientoCaja.create({ tipo, concepto: 'Zztest turno', monto: 10, metodo: 'efectivo', usuario_id: ctx.adminId });
+      await pool.query('UPDATE movimientos_caja SET fecha_hora = (($1::date + $2::time) AT TIME ZONE $3) WHERE id = $4', [F, hora, TZ, m.id]);
+    }
+  });
+
+  after(async () => {
+    await pool.query('DELETE FROM cierre_caja WHERE fecha = ANY($1::date[])', [[F, F2]]);
+    await pool.query(`DELETE FROM movimientos_caja WHERE concepto = 'Zztest turno'`);
+  });
+
+  const listaPagos = (qs) => api('GET', `/api/pagos?desde=${F}&hasta=${F}${qs}`, { token: ctx.admin });
+  const cierres = (qs = '') => api('GET', `/api/caja/cierres${qs}`, { token: ctx.admin });
+  const crearCierre = (body, token = ctx.admin) => api('POST', '/api/caja/cierres', { token, body });
+
+  it('corte exacto a las 15:00 (hora local): 14:59:59 es mañana, 15:00:00 es tarde', () => {
+    assert.equal(turnoDeFecha(new Date('2015-06-15T14:59:59-03:00')), 'mañana');
+    assert.equal(turnoDeFecha(new Date('2015-06-15T15:00:00-03:00')), 'tarde');
+    assert.equal(turnoDeFecha(new Date('2015-06-15T00:00:00-03:00')), 'mañana');
+    assert.equal(turnoDeFecha(new Date('2015-06-15T23:59:59-03:00')), 'tarde');
+  });
+
+  it('la expresión SQL de turno coincide con la de JS en el mismo borde', async () => {
+    const { rows } = await pool.query(
+      `SELECT ${turnoSql('t.ts')} AS turno FROM (VALUES ('2015-06-15T17:59:59Z'::timestamptz), ('2015-06-15T18:00:00Z'::timestamptz)) AS t(ts)`
+    );
+    assert.deepEqual(rows.map((r) => r.turno), ['mañana', 'tarde']);
+  });
+
+  it('GET /api/pagos?turno= filtra por turno y respeta el total y la paginación', async () => {
+    // estado=vigente: sin él también vuelve el anulado de 10:00 (999), que es correcto.
+    const m = await listaPagos(`&turno=${enc('mañana')}&estado=vigente`);
+    assert.equal(m.status, 200, m.text);
+    assert.deepEqual(m.body.data.map((p) => Number(p.monto)).sort((a, b) => a - b), [50, 100], 'mañana: 08:00 y 14:59:59');
+    assert.equal(m.body.meta.total, 2);
+
+    const t = await listaPagos(`&turno=${enc('tarde')}&estado=vigente`);
+    assert.deepEqual(t.body.data.map((p) => Number(p.monto)).sort((a, b) => a - b), [70, 200], 'tarde: 15:00:00 y 20:00');
+
+    const sinEstado = await listaPagos(`&turno=${enc('mañana')}`);
+    assert.equal(sinEstado.body.meta.total, 3, 'sin estado también cuenta el anulado de la mañana');
+
+    const pag = await listaPagos(`&turno=${enc('mañana')}&estado=vigente&page=2&pageSize=1`);
+    assert.equal(pag.body.data.length, 1);
+    assert.equal(pag.body.meta.total, 2, 'el total no depende de la página');
+  });
+
+  it('GET /api/pagos?turno= con valor inválido -> 400', async () => {
+    assertErrores(await listaPagos('&turno=noche'), ['turno']);
+  });
+
+  it('GET /api/caja/movimientos?turno= separa el egreso de 14:59:59 del ingreso de 15:00:00', async () => {
+    const m = await api('GET', `/api/caja/movimientos?fecha=${F}&turno=${enc('mañana')}`, { token: ctx.admin });
+    assert.equal(m.status, 200, m.text);
+    assert.deepEqual(m.body.data.filter((x) => x.concepto === 'Zztest turno').map((x) => x.tipo), ['egreso']);
+
+    const t = await api('GET', `/api/caja/movimientos?fecha=${F}&turno=${enc('tarde')}`, { token: ctx.admin });
+    assert.deepEqual(t.body.data.filter((x) => x.concepto === 'Zztest turno').map((x) => x.tipo), ['ingreso_extra']);
+  });
+
+  it('crear cierre de mañana: totales por método, cantidad y empleado; excluye anulados', async () => {
+    const r = await crearCierre({ fecha: F, turno: 'mañana' });
+    assert.equal(r.status, 201, r.text);
+    const c = r.body.data;
+    assert.equal(c.fecha, F);
+    assert.equal(c.turno, 'mañana');
+    // Cuotas 100 efectivo + 50 transferencia, menos el egreso de 10 en efectivo sembrado en este día.
+    assert.deepEqual(c.totalPorMetodo, { efectivo: 90, transferencia: 50, mixto: 0 });
+    assert.equal(c.total, 140);
+    assert.equal(c.cantidadPagos, 2);
+    // empA cobró la cuota; el admin registró el egreso sembrado en el mismo turno.
+    assert.deepEqual(c.empleados.map((e) => e.usuarioId).sort(), [empA.id, ctx.adminId].sort());
+  });
+
+  it('crear cierre de tarde: el cobro mixto se desglosa por componente y "mixto" queda informativo', async () => {
+    const r = await crearCierre({ fecha: F, turno: 'tarde' });
+    assert.equal(r.status, 201, r.text);
+    const c = r.body.data;
+    // 70 efectivo + 120 efectivo del mixto; el mixto 200 = 120 + 80 ya incluido, no suma aparte
+    // 190 de cuotas en efectivo + el ingreso extra de 10 en efectivo sembrado en este día.
+    assert.deepEqual(c.totalPorMetodo, { efectivo: 200, transferencia: 80, mixto: 200 });
+    assert.equal(c.total, 280);
+    assert.equal(c.cantidadPagos, 2);
+    // empB cobró las cuotas; el admin registró el ingreso extra sembrado en el mismo turno.
+    assert.deepEqual(c.empleados.map((e) => e.usuarioId).sort(), [empB.id, ctx.adminId].sort());
+  });
+
+  it('el mismo turno de un día no se puede cerrar dos veces: 409 y sin duplicado', async () => {
+    const r = await crearCierre({ fecha: F, turno: 'mañana' });
+    assert.equal(r.status, 409, r.text);
+    assert.match(r.body.message, /ya fue cerrado/);
+    const { rows } = await pool.query('SELECT count(*)::int n FROM cierre_caja WHERE fecha = $1 AND turno = $2', [F, 'mañana']);
+    assert.equal(rows[0].n, 1);
+  });
+
+  it('cerrar el mismo turno en otra fecha sí se permite (unicidad es por fecha + turno)', async () => {
+    const r = await crearCierre({ fecha: F2, turno: 'mañana' });
+    assert.equal(r.status, 201, r.text);
+    assert.equal(r.body.data.total, 40);
+  });
+
+  it('una fecha que no es hoy exige turno explícito -> 400', async () => {
+    assertErrores(await crearCierre({ fecha: F }), ['turno']);
+  });
+
+  it('turno inválido o fecha inválida -> 400', async () => {
+    assertErrores(await crearCierre({ fecha: F, turno: 'noche' }), ['turno']);
+    assertErrores(await crearCierre({ fecha: 'no-es-fecha', turno: 'tarde' }), ['fecha']);
+  });
+
+  it('sin token -> 401; sin caja_movimientos -> 403 (crear) y sin caja_ver -> 403 (listar)', async () => {
+    assert.equal((await api('POST', '/api/caja/cierres', { body: { fecha: F, turno: 'tarde' } })).status, 401);
+    assert.equal((await crearCierre({ fecha: F, turno: 'tarde' }, ctx.limitado)).status, 403);
+    assert.equal((await api('GET', '/api/caja/cierres', { token: ctx.limitado })).status, 403);
+  });
+
+  it('listado de cierres: filtra por fecha y por turno; "ambos" o sin turno trae los dos', async () => {
+    const todos = await cierres(`?fecha=${F}`);
+    assert.equal(todos.status, 200, todos.text);
+    assert.deepEqual(todos.body.data.map((c) => c.turno), ['mañana', 'tarde']);
+
+    const ambos = await cierres(`?fecha=${F}&turno=ambos`);
+    assert.equal(ambos.body.data.length, 2);
+
+    const soloTarde = await cierres(`?fecha=${F}&turno=${enc('tarde')}`);
+    assert.equal(soloTarde.body.data.length, 1);
+    assert.equal(soloTarde.body.data[0].total, 280);
+    assert.equal(soloTarde.body.data[0].totalPorMetodo.mixto, 200);
+  });
+
+  it('la suma de los cierres del día = cobros vigentes + ingresos extra - egresos del día', async () => {
+    const r = await cierres(`?fecha=${F}`);
+    const suma = r.body.data.reduce((acc, c) => acc + c.total, 0);
+    const pagosDia = await listaPagos('&estado=vigente');
+    const cobros = pagosDia.body.data.reduce((acc, p) => acc + Number(p.monto), 0);
+    const { rows } = await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN tipo = 'ingreso_extra' THEN monto ELSE -monto END), 0) AS neto
+       FROM movimientos_caja
+       WHERE anulado = false AND (fecha_hora AT TIME ZONE $2)::date = $1::date AND concepto = 'Zztest turno'`,
+      [F, TZ]
+    );
+    assert.equal(suma, cobros + Number(rows[0].neto));
+  });
+});
+
+// ───────────────────────── Turnos: cierre integrado (cuotas + ventas + ingresos - egresos) ─────────────────────────
+describe('Turnos: cierre integrado (cuotas + ventas + ingresos extra - egresos)', () => {
+  const F = addDays(hoyISO(), -4200); // día sin datos reales (distinto del bloque de turnos)
+  const enc = (t) => encodeURIComponent(t);
+  let empA, empB, cli;
+
+  // Suma manual, directo en SQL, de lo vigente del turno (sin pasar por el modelo que se testea).
+  const sumaManual = async (turno) => {
+    const enT = (col) => `(${col} AT TIME ZONE '${TZ}')::date = $1::date AND ${turnoSql(col)} = $2`;
+    const q = async (sql) => Number((await pool.query(sql, [F, turno])).rows[0].s);
+    const cuotas = await q(`SELECT COALESCE(SUM(p.monto),0) s FROM pagos p WHERE p.anulado = false AND ${enT('p.fecha_pago')}`);
+    const ventas = await q(`SELECT COALESCE(SUM(v.total),0) s FROM ventas v WHERE v.anulada = false AND ${enT('v.fecha_hora')}`);
+    const ingresos = await q(`SELECT COALESCE(SUM(m.monto),0) s FROM movimientos_caja m WHERE m.anulado = false AND m.tipo = 'ingreso_extra' AND ${enT('m.fecha_hora')}`);
+    const egresos = await q(`SELECT COALESCE(SUM(m.monto),0) s FROM movimientos_caja m WHERE m.anulado = false AND m.tipo = 'egreso' AND ${enT('m.fecha_hora')}`);
+    return { cuotas, ventas, ingresos, egresos, total: cuotas + ventas + ingresos - egresos };
+  };
+
+  before(async () => {
+    const rolId = await dbRole(`Zztest${randLetters()}`, []);
+    empA = { id: await dbUser({ nombre: 'Integrado Ana', email: testEmail('integA'), idRol: rolId }) };
+    empB = { id: await dbUser({ nombre: 'Integrado Bruno', email: testEmail('integB'), idRol: rolId }) };
+    cli = await crearCliente();
+
+    // ── Cuotas ──
+    await sqlPago({ clienteId: cli.id, usuarioId: empA.id, monto: 100, metodo: 'efectivo', fechaLocal: F, hora: '08:00:00' });
+    await sqlPago({ clienteId: cli.id, usuarioId: empB.id, monto: 60, metodo: 'transferencia', fechaLocal: F, hora: '16:00:00' });
+    await sqlPago({ clienteId: cli.id, usuarioId: empB.id, monto: 200, fechaLocal: F, hora: '20:00:00',
+      desglose: [{ metodo: 'efectivo', monto: 120 }, { metodo: 'transferencia', monto: 80 }] });
+    await sqlPago({ clienteId: cli.id, usuarioId: empA.id, monto: 500, metodo: 'efectivo', fechaLocal: F, hora: '09:00:00', anulado: true });
+
+    // ── Ventas del kiosco (se crean por API y después se mueve su fecha al día de prueba) ──
+    const p40 = await crearProducto({ precio: 40 });
+    const p25 = await crearProducto({ precio: 25 });
+    const p77 = await crearProducto({ precio: 77 });
+    const v1 = await crearVenta(ctx.admin, { items: [{ idProducto: p40.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 40 }] });
+    const v2 = await crearVenta(ctx.admin, { items: [{ idProducto: p25.id, cantidad: 1 }], pagos: [{ metodo: 'transferencia', monto: 25 }] });
+    const v3 = await crearVenta(ctx.admin, { items: [{ idProducto: p77.id, cantidad: 1 }], pagos: [{ metodo: 'efectivo', monto: 77 }] });
+    assert.equal(v1.status, 201, v1.text);
+    assert.equal(v2.status, 201, v2.text);
+    assert.equal(v3.status, 201, v3.text);
+    await api('POST', `/api/ventas/${v3.body.data.id}/anular`, { token: ctx.admin, body: { motivo: 'TEST turno integrado' } });
+    await pool.query('UPDATE ventas SET fecha_hora = (($1::date + $2::time) AT TIME ZONE $3) WHERE id = $4', [F, '11:00:00', TZ, v1.body.data.id]);
+    await pool.query('UPDATE ventas SET fecha_hora = (($1::date + $2::time) AT TIME ZONE $3) WHERE id = $4', [F, '15:30:00', TZ, v2.body.data.id]);
+    await pool.query('UPDATE ventas SET fecha_hora = (($1::date + $2::time) AT TIME ZONE $3) WHERE id = $4', [F, '16:00:00', TZ, v3.body.data.id]);
+
+    // ── Movimientos de caja: egresos e ingresos extra ──
+    for (const [hora, tipo, metodo, monto] of [
+      ['10:00:00', 'egreso', 'efectivo', 30],
+      ['17:00:00', 'ingreso_extra', 'transferencia', 20],
+      ['18:00:00', 'egreso', 'efectivo', 15],
+    ]) {
+      const m = await movimientoCaja.create({ tipo, concepto: 'Zztest integrado', monto, metodo, usuario_id: ctx.adminId });
+      await pool.query('UPDATE movimientos_caja SET fecha_hora = (($1::date + $2::time) AT TIME ZONE $3) WHERE id = $4', [F, hora, TZ, m.id]);
+    }
+  });
+
+  after(async () => {
+    await pool.query('DELETE FROM cierre_caja WHERE fecha = $1', [F]);
+    await pool.query(`DELETE FROM movimientos_caja WHERE concepto = 'Zztest integrado'`);
+  });
+
+  const estado = (turno) => api('GET', `/api/caja/cierres/estado?fecha=${F}&turno=${enc(turno)}`, { token: ctx.admin });
+
+  it('sumas manuales de la fixture: mañana = 100 cuotas + 40 ventas - 30 egreso (la anulada y la cuota anulada no cuentan)', async () => {
+    const m = await sumaManual('mañana');
+    assert.deepEqual([m.cuotas, m.ventas, m.ingresos, m.egresos, m.total], [100, 40, 0, 30, 110]);
+    const t = await sumaManual('tarde');
+    assert.deepEqual([t.cuotas, t.ventas, t.ingresos, t.egresos, t.total], [260, 25, 20, 15, 290]);
+  });
+
+  it('estado en vivo (turno abierto): desglose completo, neto = cuotas + ventas + ingresos - egresos', async () => {
+    const r = await estado('mañana');
+    assert.equal(r.status, 200, r.text);
+    const { cerrado, enVivo } = r.body.data;
+    assert.equal(cerrado, null);
+    assert.equal(enVivo.total, 110);
+    assert.deepEqual(enVivo.totalPorMetodo, { efectivo: 110, transferencia: 0, mixto: 0 });
+    assert.equal(enVivo.totalCuotas, 100);
+    assert.equal(enVivo.totalVentas, 40);
+    assert.equal(enVivo.totalIngresosExtra, 0);
+    assert.equal(enVivo.totalEgresos, 30);
+    assert.equal(enVivo.desglose.ventas.efectivo, 40);
+    assert.equal(enVivo.desglose.egresos.efectivo, 30);
+    // el empleado de la venta (admin) y el de la cuota (empA) aparecen; el de un movimiento también es admin
+    const ids = enVivo.empleados.map((e) => e.usuarioId).sort();
+    assert.deepEqual(ids, [ctx.adminId, empA.id].sort());
+  });
+
+  it('cierre de mañana: el total guardado coincide con sumar a mano cuotas + ventas - egresos', async () => {
+    const r = await api('POST', '/api/caja/cierres', { token: ctx.admin, body: { fecha: F, turno: 'mañana' } });
+    assert.equal(r.status, 201, r.text);
+    const c = r.body.data;
+    const manual = await sumaManual('mañana');
+    assert.equal(c.total, manual.total);
+    assert.equal(c.total, 110);
+    assert.equal(c.totalCuotas, manual.cuotas);
+    assert.equal(c.totalVentas, manual.ventas);
+    assert.equal(c.totalEgresos, manual.egresos);
+  });
+
+  it('cierre de tarde: cuotas + ventas + ingresos extra - egresos, con el mixto desglosado por método', async () => {
+    const r = await api('POST', '/api/caja/cierres', { token: ctx.admin, body: { fecha: F, turno: 'tarde' } });
+    assert.equal(r.status, 201, r.text);
+    const c = r.body.data;
+    const manual = await sumaManual('tarde');
+    assert.equal(c.total, manual.total);
+    assert.equal(c.total, 290);
+    assert.equal(c.totalIngresosExtra, manual.ingresos);
+    // efectivo: 120 (mixto) - 15 (egreso); transferencia: 60 + 80 (mixto) + 25 (venta) + 20 (ingreso)
+    assert.deepEqual(c.totalPorMetodo, { efectivo: 105, transferencia: 185, mixto: 200 });
+    assert.equal(c.totalPorMetodo.efectivo + c.totalPorMetodo.transferencia, c.total, 'los métodos suman el neto');
+    assert.equal(c.desglose.cuotas.cobrosMixtos, 200);
+    assert.equal(c.cantidadPagos, 2);
+  });
+
+  it('el estado de un turno cerrado devuelve el snapshot con el mismo desglose que tenía en vivo', async () => {
+    const r = await estado('mañana');
+    const { cerrado, enVivo } = r.body.data;
+    assert.equal(enVivo, null);
+    assert.equal(cerrado.total, 110);
+    assert.deepEqual(Object.keys(cerrado.desglose).sort(), ['cuotas', 'egresos', 'ingresosExtra', 'ventas']);
+    assert.equal(cerrado.desglose.cuotas.total, 100);
+    assert.equal(cerrado.desglose.ventas.total, 40);
+    assert.equal(cerrado.desglose.egresos.total, 30);
+  });
+
+  it('el listado de cierres guarda los totales de cada fuente, no solo el neto', async () => {
+    const r = await api('GET', `/api/caja/cierres?fecha=${F}`, { token: ctx.admin });
+    const tarde = r.body.data.find((c) => c.turno === 'tarde');
+    assert.equal(tarde.totalVentas, 25);
+    assert.equal(tarde.totalIngresosExtra, 20);
+    assert.equal(tarde.totalEgresos, 15);
+    assert.equal(tarde.total, 290);
   });
 });

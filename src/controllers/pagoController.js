@@ -2,6 +2,7 @@ const pago = require('../models/pago');
 const rol = require('../models/rol');
 const V = require('../utils/validators');
 const { hoyISO } = require('../config/fechas');
+const { TURNOS } = require('../utils/turno');
 
 function toCamelCase(obj) {
   if (!obj) return null;
@@ -42,10 +43,15 @@ function validarDesglose(raw) {
   return { value: raw.map((p) => ({ metodo: p.metodo, monto: Number(p.monto) })) };
 }
 
+// "mixto" existe en pagos.metodo solo como resumen de un cobro dividido: se filtra, pero nunca se
+// manda como `metodo` al crear (el desglose real vive en pago_metodos).
+const METODOS_FILTRO = [...METODOS_PAGO, 'mixto'];
+
 const findAllSchema = {
   desde: V.fecha('Desde'),
   hasta: V.fecha('Hasta'),
-  metodo: V.enumOf('El método de pago', METODOS_PAGO),
+  metodo: V.enumOf('El método de pago', METODOS_FILTRO),
+  turno: V.enumOf('El turno', TURNOS),
   usuarioId: V.uuid('El empleado'),
   estado: V.enumOf('El estado', ['vigente', 'anulado']),
   clienteQuery: V.texto('La búsqueda', { max: 100 }),
@@ -121,7 +127,7 @@ async function findAll(req, res) {
     const page = Number.parseInt(req.query.page, 10) || 1;
     const pageSize = Math.min(Number.parseInt(req.query.pageSize, 10) || 20, 100);
     const filtros = {
-      desde: v.desde, hasta: v.hasta, metodo: v.metodo, usuarioId: v.usuarioId,
+      desde: v.desde, hasta: v.hasta, metodo: v.metodo, turno: v.turno, usuarioId: v.usuarioId,
       estado: v.estado, clienteQuery: v.clienteQuery,
     };
 

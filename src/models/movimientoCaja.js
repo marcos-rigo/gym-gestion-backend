@@ -1,5 +1,6 @@
 const { pool } = require('../config/db');
 const { TZ } = require('../config/fechas');
+const { turnoSql } = require('../utils/turno');
 
 async function findById(id) {
   const { rows } = await pool.query('SELECT * FROM movimientos_caja WHERE id = $1', [id]);
@@ -15,12 +16,13 @@ async function create({ tipo, concepto, monto, metodo, usuario_id }) {
   return findById(rows[0].id);
 }
 
-async function findByFecha({ fecha, usuarioId, tipo } = {}) {
+async function findByFecha({ fecha, usuarioId, tipo, turno } = {}) {
   const params = [fecha];
   const p = (v) => { params.push(v); return `$${params.length}`; };
   const where = [`(m.fecha_hora AT TIME ZONE '${TZ}')::date = $1::date`];
   if (usuarioId) where.push(`m.id_usuario = ${p(usuarioId)}`);
   if (tipo) where.push(`m.tipo = ${p(tipo)}`);
+  if (turno) where.push(`${turnoSql('m.fecha_hora')} = ${p(turno)}`);
 
   const { rows } = await pool.query(`
     SELECT m.*, u.nombre AS usuario_nombre, a.nombre AS anulado_por_nombre

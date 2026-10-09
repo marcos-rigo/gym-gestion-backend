@@ -5,6 +5,7 @@ const { cargarRol } = auth;
 const checkPermiso = require('../middlewares/checkPermiso');
 const {
   crearMovimiento, listarMovimientos, anularMovimiento, getApertura, putApertura, getCierre,
+  crearCierre, listarCierres, getEstadoTurno,
 } = require('../controllers/cajaController');
 
 const router = Router();
@@ -17,5 +18,8 @@ router.post('/movimientos/:id/anular', checkPermiso('caja_movimientos'), anularM
 router.get('/apertura', checkPermiso('caja_ver'), getApertura);
 router.put('/apertura', checkPermiso('caja_movimientos'), putApertura);
 router.get('/cierre', checkPermiso('caja_ver'), getCierre);
+router.get('/cierres', checkPermiso('caja_ver'), listarCierres);
+router.get('/cierres/estado', checkPermiso('caja_ver'), getEstadoTurno);
+router.post('/cierres', checkPermiso('caja_movimientos'), crearCierre);
 
 module.exports = router;

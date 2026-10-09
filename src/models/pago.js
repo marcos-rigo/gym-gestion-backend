@@ -1,5 +1,6 @@
 const { pool, withTransaction } = require('../config/db');
 const { TZ, HOY_SQL, PERIODO_DIAS } = require('../config/fechas');
+const { turnoSql } = require('../utils/turno');
 
 // Resuelve el `metodo` resumen de pagos.metodo ('efectivo' | 'transferencia' | 'mixto') y las
 // filas de pago_metodos a insertar, a partir de `metodo` legacy o de un desglose explícito.
@@ -137,7 +138,7 @@ async function findByCliente(cliente_id) {
 
 // Arma el WHERE compartido por `findAll` y `count` a partir de los mismos filtros,
 // para que la paginación no pueda desincronizarse del listado.
-function buildFiltros({ desde, hasta, metodo, usuarioId, estado, clienteQuery } = {}) {
+function buildFiltros({ desde, hasta, metodo, turno, usuarioId, estado, clienteQuery } = {}) {
   const where = ['1=1'];
   const params = [];
   const p = (value) => {
@@ -147,7 +148,18 @@ function buildFiltros({ desde, hasta, metodo, usuarioId, estado, clienteQuery } 
 
   if (desde) where.push(`(p.fecha_pago AT TIME ZONE '${TZ}')::date >= ${p(desde)}`);
   if (hasta) where.push(`(p.fecha_pago AT TIME ZONE '${TZ}')::date <= ${p(hasta)}`);
-  if (metodo) where.push(`p.metodo = ${p(metodo)}`);
+  // efectivo/transferencia incluyen también los cobros mixtos que tuvieron ese componente.
+  // EXISTS (y no JOIN) para no duplicar el pago si tiene varios componentes del mismo método.
+  // "mixto" filtra solo por el resumen pagos.metodo.
+  if (metodo === 'efectivo' || metodo === 'transferencia') {
+    const ref = p(metodo);
+    where.push(`(p.metodo = ${ref} OR EXISTS (
+      SELECT 1 FROM pago_metodos pm WHERE pm.id_pago = p.id AND pm.metodo = ${ref}
+    ))`);
+  } else if (metodo) {
+    where.push(`p.metodo = ${p(metodo)}`);
+  }
+  if (turno) where.push(`${turnoSql('p.fecha_pago')} = ${p(turno)}`);
   if (usuarioId) where.push(`p.usuario_id = ${p(usuarioId)}`);
   if (estado === 'anulado') where.push('p.anulado = true');
   if (estado === 'vigente') where.push('p.anulado = false');

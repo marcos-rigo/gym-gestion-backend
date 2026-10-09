@@ -5,6 +5,8 @@ const venta = require('../models/venta');
 const rol = require('../models/rol');
 const V = require('../utils/validators');
 const { hoyISO } = require('../config/fechas');
+const cierreCaja = require('../models/cierreCaja');
+const { TURNOS, turnoDeFecha } = require('../utils/turno');
 
 function toCamelCase(obj) {
   if (!obj) return null;
@@ -51,6 +53,7 @@ async function crearMovimiento(req, res) {
 const listadoMovimientosSchema = {
   fecha: V.fecha('La fecha'),
   tipo: V.enumOf('El tipo', TIPOS_MOVIMIENTO),
+  turno: V.enumOf('El turno', TURNOS),
 };
 
 async function listarMovimientos(req, res) {
@@ -60,7 +63,7 @@ async function listarMovimientos(req, res) {
 
     const todos = await verTodos(req);
     const data = await movimientoCaja.findByFecha({
-      fecha: v.fecha || hoyISO(), tipo: v.tipo, usuarioId: todos ? undefined : req.user.id,
+      fecha: v.fecha || hoyISO(), tipo: v.tipo, turno: v.turno, usuarioId: todos ? undefined : req.user.id,
     });
     return res.json({ data: toCamelCase(data) });
   } catch (err) {
@@ -210,4 +213,129 @@ async function getCierre(req, res) {
   }
 }
 
-module.exports = { crearMovimiento, listarMovimientos, anularMovimiento, getApertura, putApertura, getCierre };
+// Cierre por turno: un registro por (fecha, turno), con snapshot de totales por método y empleados.
+// Sin fecha = hoy; sin turno = el turno actual (solo válido para hoy: una fecha pasada necesita turno).
+const crearCierreSchema = {
+  fecha: V.fecha('La fecha'),
+  turno: V.enumOf('El turno', TURNOS),
+};
+
+// Forma común del cierre de un turno, sea guardado (snapshot) o en vivo. `totalPorMetodo.mixto` es
+// informativo (cobros divididos, ya incluidos en efectivo/transferencia), no suma al total.
+function presentarTotales(t) {
+  return {
+    totalPorMetodo: { efectivo: t.totalEfectivo, transferencia: t.totalTransferencia, mixto: t.totalMixto },
+    total: t.total,
+    totalCuotas: t.totalCuotas,
+    totalVentas: t.totalVentas,
+    totalIngresosExtra: t.totalIngresosExtra,
+    totalEgresos: t.totalEgresos,
+    cantidadPagos: t.cantidadPagos,
+    desglose: t.detalle,
+    empleados: t.empleados,
+  };
+}
+
+function presentarCierre(c) {
+  return {
+    id: c.id,
+    fecha: c.fecha,
+    turno: c.turno,
+    totalPorMetodo: {
+      efectivo: Number(c.total_efectivo),
+      transferencia: Number(c.total_transferencia),
+      mixto: Number(c.total_mixto),
+    },
+    total: Number(c.total),
+    totalCuotas: Number(c.total_cuotas),
+    totalVentas: Number(c.total_ventas),
+    totalIngresosExtra: Number(c.total_ingresos_extra),
+    totalEgresos: Number(c.total_egresos),
+    cantidadPagos: c.cantidad_pagos,
+    desglose: c.detalle,
+    empleados: c.empleados,
+    creadoPorNombre: c.creado_por_nombre ?? null,
+    createdAt: c.created_at,
+  };
+}
+
+async function crearCierre(req, res) {
+  try {
+    const { ok, values: v, errors } = V.validate(req.body ?? {}, crearCierreSchema, { partial: true });
+    if (!ok) return V.sendValidationError(res, errors);
+
+    const fecha = v.fecha || hoyISO();
+    const turno = v.turno ?? (fecha === hoyISO() ? turnoDeFecha(new Date()) : null);
+    if (!turno) return V.sendValidationError(res, { turno: 'Indicá el turno para cerrar una fecha que no es hoy' });
+
+    const totales = await cierreCaja.getTotalesTurno({ fecha, turno });
+    const item = await cierreCaja.create({ fecha, turno, totales, usuario_id: req.user.id });
+    return res.status(201).json({ data: presentarCierre(item) });
+  } catch (err) {
+    if (err.code === '23505') {
+      return V.sendConflict(res, 'Este turno ya fue cerrado', { turno: 'Ya existe un cierre para esta fecha y turno' });
+    }
+    console.error('caja.crearCierre error:', err);
+    return res.status(500).json({ message: 'Error interno del servidor' });
+  }
+}
+
+const listarCierresSchema = {
+  fecha: V.fecha('La fecha'),
+  turno: V.enumOf('El turno', [...TURNOS, 'ambos']),
+};
+
+async function listarCierres(req, res) {
+  try {
+    const { ok, values: v, errors } = V.validate(req.query, listarCierresSchema, { partial: true });
+    if (!ok) return V.sendValidationError(res, errors);
+
+    const data = await cierreCaja.findAll({
+      fecha: v.fecha || undefined,
+      turno: v.turno && v.turno !== 'ambos' ? v.turno : undefined,
+    });
+    return res.json({ data: data.map(presentarCierre) });
+  } catch (err) {
+    console.error('caja.listarCierres error:', err);
+    return res.status(500).json({ message: 'Error interno del servidor' });
+  }
+}
+
+// Estado de un turno: si ya está cerrado devuelve el snapshot; si no, el resumen en vivo.
+// Sirve para recalcular al cambiar fecha/turno y para que "cerrado" persista al recargar.
+const estadoTurnoSchema = {
+  fecha: V.fecha('La fecha'),
+  turno: V.enumOf('El turno', TURNOS),
+};
+
+async function getEstadoTurno(req, res) {
+  try {
+    const { ok, values: v, errors } = V.validate(req.query, estadoTurnoSchema, { partial: true });
+    if (!ok) return V.sendValidationError(res, errors);
+
+    const fecha = v.fecha || hoyISO();
+    const turno = v.turno ?? (fecha === hoyISO() ? turnoDeFecha(new Date()) : null);
+    if (!turno) return V.sendValidationError(res, { turno: 'Indicá el turno para una fecha que no es hoy' });
+
+    const [cierre] = await cierreCaja.findAll({ fecha, turno });
+    const enVivo = cierre ? null : presentarTotales(await cierreCaja.getTotalesTurno({ fecha, turno }));
+
+    return res.json({
+      data: {
+        fecha,
+        turno,
+        turnoActual: turnoDeFecha(new Date()),
+        cerrado: cierre ? presentarCierre(cierre) : null,
+        enVivo,
+      },
+    });
+  } catch (err) {
+    console.error('caja.getEstadoTurno error:', err);
+    return res.status(500).json({ message: 'Error interno del servidor' });
+  }
+}
+
+module.exports = {
+  crearMovimiento, listarMovimientos, anularMovimiento, getApertura, putApertura, getCierre,
+  crearCierre, listarCierres, getEstadoTurno,
+};
